@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# The exit servers' NetBird client: v0.81.5 plus the WebSocket patch (stock gRPC cannot pass Cloudflare) and
+# The exit servers' NetBird client: v0.82.0 plus the WebSocket patch (stock gRPC cannot pass Cloudflare) and
 # Maybenot padding (off unless NB_DAITA_MACHINES or NB_DAITA_FULL_SIZE is set; Hopper's app/CLAUDE.md), and ECH to the
 # host in NB_ECH_HOST, and the two ICE fixes (netbird-answer-first.patch, netbird-hold-candidates.patch).
-# Output: build/netbird-0.81.5-hopper.gz and build/SHA256SUMS, for publish-client.sh.
+# Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish-client.sh.
 set -euo pipefail
 
-NB_VERSION=v0.81.5
+NB_VERSION=v0.82.0
 NB_SRC=${NB_SRC:-$HOME/src/netbird}
 WG_SRC=${WG_SRC:-$HOME/src/wireguard-go-nb}
 GO_ROOT=${GO_ROOT:-$HOME/src/go1.26}
@@ -34,8 +34,8 @@ for patch in "${nb_patches[@]}" "${wg_patches[@]}"; do
 done
 git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
 # Padding goes onto the netbirdio/wireguard-go commit this NetBird release pins.
-WG_COMMIT=$(git -C "$NB_SRC" show "$NB_VERSION:go.mod" | awk '$1 == "replace" && $2 == "golang.zx2c4.com/wireguard" {print $5}' | sed 's/.*-//')
-[ -n "$WG_COMMIT" ] || { echo "no wireguard-go replace in $NB_VERSION go.mod" >&2; exit 1; }
+WG_COMMIT=$(git -C "$NB_SRC" show "$NB_VERSION:go.mod" | awk '$1 == "github.com/netbirdio/wireguard-go" {print $2; exit}' | sed 's/.*-//')
+[[ "$WG_COMMIT" =~ ^[0-9a-f]{12}$ ]] || { echo "no netbirdio/wireguard-go requirement in $NB_VERSION go.mod" >&2; exit 1; }
 [ -d "$WG_SRC" ] || git clone -q https://github.com/netbirdio/wireguard-go.git "$WG_SRC"
 git -C "$WG_SRC" rev-parse -q --verify "$WG_COMMIT^{commit}" >/dev/null || { echo "$WG_SRC has no commit $WG_COMMIT" >&2; exit 1; }
 
@@ -60,7 +60,9 @@ mkdir -p "$wgwt/maybenot-ffi/lib/linux_amd64"
 cp "$wgwt/maybenot-ffi/target/x86_64-unknown-linux-gnu/release/libmaybenot_ffi.a" "$wgwt/maybenot-ffi/lib/linux_amd64/libmaybenot.a"
 
 cd "$wt"
-go mod edit -replace "golang.zx2c4.com/wireguard=$wgwt"
+go mod edit -replace "github.com/netbirdio/wireguard-go=$wgwt"
+# A replace of a module the tree does not require is accepted silently and would build the exit without padding.
+[ "$(go list -m -f '{{if .Replace}}{{.Replace.Path}}{{end}}' github.com/netbirdio/wireguard-go)" = "$wgwt" ] || { echo "$NB_VERSION does not use github.com/netbirdio/wireguard-go; update the module path" >&2; exit 1; }
 rm -f "$build/$NAME"
 # Static, so the sandbox's glibc does not matter; netgo and osusergo keep Go's own lookups off glibc. The linker's
 # glibc warnings come from Rust's std inside libmaybenot.a, on paths Maybenot never calls.
