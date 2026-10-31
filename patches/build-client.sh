@@ -22,8 +22,15 @@ wt=$build/netbird-client-src
 wgwt=$build/wireguard-go-src
 mkdir -p "$build" "$dl"
 
-for patch in netbird-grpc-websocket.patch netbird-daita.patch netbird-ech.patch netbird-answer-first.patch netbird-hold-candidates.patch wireguard-daita.patch; do
-  [ -f "$HOPPER_APP/$patch" ] || { echo "patch not found: $HOPPER_APP/$patch" >&2; exit 1; }
+# The list is app/patches.list; "wireguard" lines go to the wireguard-go checkout.
+list=$HOPPER_APP/patches.list
+pick() { awk -v b="$1" -v k="$2" '/^#/ || !NF {next} {w=0; n=0; for (i=2; i<=NF; i++) {if ($i=="wireguard") w=1; if ($i==b) n=1} if (n && ((k=="wireguard")==w)) print $1}' "$list" ; }
+nb_patches=(); wg_patches=()
+while read -r patch; do nb_patches+=("$HOPPER_APP/$patch"); done < <(pick exit netbird)
+while read -r patch; do wg_patches+=("$HOPPER_APP/$patch"); done < <(pick exit wireguard)
+[ -f "$list" ] && [ "${#nb_patches[@]}" -gt 0 ] && [ "${#wg_patches[@]}" -gt 0 ] || { echo "no exit patches in $list" >&2; exit 1; }
+for patch in "${nb_patches[@]}" "${wg_patches[@]}"; do
+  [ -f "$patch" ] || { echo "patch not found: $patch" >&2; exit 1; }
 done
 git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
 # Padding goes onto the netbirdio/wireguard-go commit this NetBird release pins.
@@ -44,8 +51,8 @@ git -C "$NB_SRC" worktree add --detach "$wt" "$NB_VERSION" >/dev/null
 git -C "$WG_SRC" worktree add --detach "$wgwt" "$WG_COMMIT" >/dev/null
 trap cleanup EXIT
 [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "worktree is not clean" >&2; exit 1; }
-git -C "$wt" apply "$HOPPER_APP/netbird-grpc-websocket.patch" "$HOPPER_APP/netbird-daita.patch" "$HOPPER_APP/netbird-ech.patch" "$HOPPER_APP/netbird-answer-first.patch" "$HOPPER_APP/netbird-hold-candidates.patch"
-git -C "$wgwt" apply "$HOPPER_APP/wireguard-daita.patch"
+git -C "$wt" apply "${nb_patches[@]}"
+git -C "$wgwt" apply "${wg_patches[@]}"
 git -C "$wt" diff --stat
 
 (cd "$wgwt/maybenot-ffi" && RUSTFLAGS="-C metadata=maybenot-ffi" cargo rustc -q --crate-type=staticlib --release --locked --target x86_64-unknown-linux-gnu --target-dir target)

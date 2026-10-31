@@ -1,0 +1,10 @@
+# Hopper's NetBird patches, in apply order (later ones build on earlier ones).
+# Second word on: phone = the app's library (app/build-netbird.sh), exit = the exit servers' client
+# (server/scripts/build-client.sh, copied to the public repo by publish-client.sh).
+# A line with "wireguard" applies to the wireguard-go checkout instead of NetBird.
+netbird-grpc-websocket.patch phone exit
+netbird-daita.patch phone exit
+netbird-ech.patch phone exit
+netbird-answer-first.patch phone exit
+netbird-hold-candidates.patch phone exit
+wireguard-daita.patch wireguard phone exit
