@@ -1,0 +1,265 @@
+diff --git a/client/internal/peer/worker_ice.go b/client/internal/peer/worker_ice.go
+index 5979e9bd..13a34526 100644
+--- a/client/internal/peer/worker_ice.go
++++ b/client/internal/peer/worker_ice.go
+@@ -65,10 +65,27 @@ type WorkerICE struct {
+ 	// portForwardAttempted tracks if we've already tried port forwarding this session
+ 	portForwardAttempted bool
+ 
++	// recentCandidates keeps the remote candidates of the last few seconds for the next agent.
++	recentCandidates []recentCandidate
++
+ 	// dialFunc, when non-nil, replaces agentDial in connect(). Only for tests.
+ 	dialFunc func(ctx context.Context, agent *icemaker.ThreadSafeAgent, remoteOfferAnswer *OfferAnswer) (net.Conn, error)
+ }
+ 
++// Candidates travel on the signal stream while offers and answers are handled on the handshaker's goroutine, so a
++// remote candidate can arrive before its agent exists, or while the agent it is about to replace still runs. Each
++// new agent gets the candidates of the last few seconds; one from an abandoned round only adds a pair that fails.
++const (
++	recentCandidateTTL  = 5 * time.Second
++	maxRecentCandidates = 64
++)
++
++type recentCandidate struct {
++	candidate ice.Candidate
++	received  time.Time
++	used      bool
++}
++
+ func NewWorkerICE(ctx context.Context, log *log.Entry, config ConnConfig, conn *Conn, signaler *Signaler, ifaceDiscover stdnet.ExternalIFaceDiscover, statusRecorder *Status, hasRelayOnLocally bool) (*WorkerICE, error) {
+ 	sessionID, err := NewICESessionID()
+ 	if err != nil {
+@@ -145,6 +162,7 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
+ 	w.agent = agent
+ 	w.agentDialerCancel = dialerCancel
+ 	w.agentConnecting = true
++	w.addRecentCandidates(agent)
+ 	if remoteOfferAnswer.SessionID != nil {
+ 		w.remoteSessionID = *remoteOfferAnswer.SessionID
+ 	} else {
+@@ -161,12 +179,58 @@ func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HA
+ 	w.muxAgent.Lock()
+ 	defer w.muxAgent.Unlock()
+ 	w.log.Debugf("OnRemoteCandidate from peer %s -> %s", w.config.Key, candidate.String())
++	w.keepRecentCandidate(candidate, w.agent != nil)
+ 	if w.agent == nil {
+-		w.log.Warnf("ICE Agent is not initialized yet")
++		w.log.Infof("ICE Agent is not initialized yet, keeping the candidate for the next agent")
+ 		return
+ 	}
+ 
+-	if err := w.agent.AddRemoteCandidate(candidate); err != nil {
++	w.addRemoteCandidate(w.agent, candidate)
++}
++
++// pruneRecentCandidates drops expired entries. Caller must hold muxAgent.
++func (w *WorkerICE) pruneRecentCandidates() {
++	now := time.Now()
++	kept := w.recentCandidates[:0]
++	unused := 0
++	for _, r := range w.recentCandidates {
++		switch {
++		case now.Sub(r.received) <= recentCandidateTTL:
++			kept = append(kept, r)
++		case !r.used:
++			unused++
++		}
++	}
++	w.recentCandidates = kept
++	if unused > 0 {
++		w.log.Infof("dropped %d remote candidates that no ICE agent received within %s", unused, recentCandidateTTL)
++	}
++}
++
++// keepRecentCandidate stores the candidate; when full, the oldest goes. Caller must hold muxAgent.
++func (w *WorkerICE) keepRecentCandidate(candidate ice.Candidate, used bool) {
++	w.pruneRecentCandidates()
++	if len(w.recentCandidates) == maxRecentCandidates {
++		w.log.Debugf("more than %d remote candidates in %s, dropping the oldest", maxRecentCandidates, recentCandidateTTL)
++		w.recentCandidates = append(w.recentCandidates[:0], w.recentCandidates[1:]...)
++	}
++	w.recentCandidates = append(w.recentCandidates, recentCandidate{candidate: candidate, received: time.Now(), used: used})
++}
++
++// addRecentCandidates gives a new agent the remote candidates that are still fresh. Caller must hold muxAgent.
++func (w *WorkerICE) addRecentCandidates(agent *icemaker.ThreadSafeAgent) {
++	w.pruneRecentCandidates()
++	for i := range w.recentCandidates {
++		w.addRemoteCandidate(agent, w.recentCandidates[i].candidate)
++		w.recentCandidates[i].used = true
++	}
++	if n := len(w.recentCandidates); n > 0 {
++		w.log.Infof("gave the new ICE agent %d remote candidates received in the last %s", n, recentCandidateTTL)
++	}
++}
++
++func (w *WorkerICE) addRemoteCandidate(agent *icemaker.ThreadSafeAgent, candidate ice.Candidate) {
++	if err := agent.AddRemoteCandidate(candidate); err != nil {
+ 		w.log.Errorf("error while handling remote candidate")
+ 		return
+ 	}
+@@ -180,7 +244,7 @@ func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HA
+ 			return
+ 		}
+ 
+-		if err := w.agent.AddRemoteCandidate(extraSrflx); err != nil {
++		if err := agent.AddRemoteCandidate(extraSrflx); err != nil {
+ 			w.log.Errorf("error while handling remote candidate")
+ 			return
+ 		}
+@@ -211,6 +275,7 @@ func (w *WorkerICE) Close() {
+ 			w.log.Warnf("failed to close ICE agent: %s", err)
+ 		}
+ 	}
++	w.recentCandidates = nil
+ 	// Unconditional: a dial goroutine racing this Close skips its own cleanup
+ 	// (closeAgent finds a nil agent), so the flags must be dropped here too or
+ 	// the reconnection guard reads the stale state as Connected forever.
+diff --git a/client/internal/peer/worker_ice_recent_test.go b/client/internal/peer/worker_ice_recent_test.go
+new file mode 100644
+index 00000000..f0427f5a
+--- /dev/null
++++ b/client/internal/peer/worker_ice_recent_test.go
+@@ -0,0 +1,141 @@
++package peer
++
++import (
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/pion/ice/v4"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func hostCandidate(t *testing.T, addr string) ice.Candidate {
++	t.Helper()
++	c, err := ice.NewCandidateHost(&ice.CandidateHostConfig{Network: "udp", Address: addr, Port: 51820, Component: 1})
++	require.NoError(t, err)
++	return c
++}
++
++func testOffer(session string) *OfferAnswer {
++	id := ICESessionID(session)
++	return &OfferAnswer{
++		IceCredentials: IceCredentials{UFrag: "remoteufrag", Pwd: "remote-password-long-enough"},
++		SessionID:      &id,
++	}
++}
++
++// agentHas reports whether the current agent has a remote candidate at addr. It must not fail the test: it runs
++// inside assert.Eventually and assert.Never, off the test goroutine.
++func agentHas(w *WorkerICE, addr string) bool {
++	w.muxAgent.Lock()
++	agent := w.agent
++	w.muxAgent.Unlock()
++	if agent == nil {
++		return false
++	}
++	cs, err := agent.GetRemoteCandidates()
++	if err != nil {
++		return false
++	}
++	for _, c := range cs {
++		if c.Address() == addr {
++			return true
++		}
++	}
++	return false
++}
++
++func newRecentTestWorker(t *testing.T) *WorkerICE {
++	w := newTestWorkerICE(t)
++	t.Cleanup(w.Close)
++	w.dialFunc = parkDial
++	return w
++}
++
++// A candidate that arrives before the offer or answer that creates the agent must reach that agent, or the
++// round fails and the peers stay relayed until a later round happens to get the order right.
++func TestWorkerICE_CandidateBeforeAgentReachesIt(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.10"), nil)
++	w.OnNewOffer(testOffer("remote-session"))
++
++	assert.Eventually(t, func() bool { return agentHas(w, "192.0.2.10") }, 2*time.Second, 10*time.Millisecond,
++		"the kept candidate must reach the new agent")
++}
++
++// A candidate for the next session can land in the agent that the next offer replaces; the replacement must get it.
++func TestWorkerICE_CandidateInReplacedAgentReachesTheNewOne(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	w.OnNewOffer(testOffer("first"))
++	w.muxAgent.Lock()
++	first := w.agent
++	w.muxAgent.Unlock()
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.30"), nil)
++	w.OnNewOffer(testOffer("second"))
++
++	w.muxAgent.Lock()
++	second := w.agent
++	w.muxAgent.Unlock()
++	require.NotSame(t, first, second, "the new session must replace the agent")
++	assert.Eventually(t, func() bool { return agentHas(w, "192.0.2.30") }, 2*time.Second, 10*time.Millisecond,
++		"the candidate must reach the replacement agent")
++}
++
++// A candidate older than the limit belongs to an abandoned negotiation and is not given to a new agent.
++func TestWorkerICE_ExpiredCandidateIsNotGiven(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.20"), nil)
++	w.muxAgent.Lock()
++	w.recentCandidates[0].received = time.Now().Add(-2 * recentCandidateTTL)
++	w.muxAgent.Unlock()
++	w.OnNewOffer(testOffer("remote-session"))
++
++	assert.Never(t, func() bool { return agentHas(w, "192.0.2.20") }, 300*time.Millisecond, 10*time.Millisecond,
++		"the expired candidate must not reach the new agent")
++}
++
++// Expired candidates leave the store when the next one arrives, so it holds only recent ones.
++func TestWorkerICE_ExpiredCandidateLeavesTheStore(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.22"), nil)
++	w.muxAgent.Lock()
++	w.recentCandidates[0].received = time.Now().Add(-2 * recentCandidateTTL)
++	w.muxAgent.Unlock()
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.23"), nil)
++
++	w.muxAgent.Lock()
++	defer w.muxAgent.Unlock()
++	require.Len(t, w.recentCandidates, 1)
++	assert.Equal(t, "192.0.2.23", w.recentCandidates[0].candidate.Address())
++}
++
++// The store is bounded: past the limit the oldest candidate goes.
++func TestWorkerICE_RecentCandidatesAreBounded(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	for i := 0; i < maxRecentCandidates+5; i++ {
++		w.OnRemoteCandidate(hostCandidate(t, fmt.Sprintf("192.0.2.%d", i+1)), nil)
++	}
++
++	w.muxAgent.Lock()
++	defer w.muxAgent.Unlock()
++	require.Len(t, w.recentCandidates, maxRecentCandidates)
++	assert.Equal(t, "192.0.2.6", w.recentCandidates[0].candidate.Address(), "the oldest five must have gone")
++}
++
++// Close ends the connection; its candidates must not reach an agent after a reopen.
++func TestWorkerICE_CloseForgetsCandidates(t *testing.T) {
++	w := newRecentTestWorker(t)
++
++	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.40"), nil)
++	w.Close()
++
++	w.muxAgent.Lock()
++	defer w.muxAgent.Unlock()
++	assert.Empty(t, w.recentCandidates)
++}
