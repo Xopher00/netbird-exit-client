@@ -1,0 +1,72 @@
+diff --git a/client/grpc/dialer.go b/client/grpc/dialer.go
+index 9a6bc06..c66fde2 100644
+--- a/client/grpc/dialer.go
++++ b/client/grpc/dialer.go
+@@ -5,17 +5,23 @@ import (
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"fmt"
++	"net"
++	"net/http"
++	"os"
+ 	"runtime"
+ 	"time"
+ 
+ 	"github.com/cenkalti/backoff/v4"
++	"github.com/coder/websocket"
+ 	log "github.com/sirupsen/logrus"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/keepalive"
+ 
++	nbnet "github.com/netbirdio/netbird/client/net"
+ 	"github.com/netbirdio/netbird/util/embeddedroots"
++	"github.com/netbirdio/netbird/util/wsproxy"
+ )
+ 
+ // Backoff returns a backoff configuration for gRPC calls
+@@ -56,6 +62,12 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
+ 		}),
+ 	}
+ 	opts = append(opts, extraOpts...)
++	// Through a proxy that does not pass HTTP/2 to the server, carry gRPC inside the server's WebSocket wrapper.
++	// Appended last because gRPC uses the last context dialer; the WebSocket's TLS replaces gRPC's own.
++	if os.Getenv("NB_GRPC_WEBSOCKET") == "true" && runtime.GOOS != "js" {
++		opts[0] = grpc.WithTransportCredentials(insecure.NewCredentials())
++		opts = append(opts, grpc.WithContextDialer(webSocketDialer(tlsEnabled, component)))
++	}
+ 
+ 	conn, err := grpc.DialContext(connCtx, addr, opts...)
+ 	if err != nil {
+@@ -64,3 +76,30 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
+ 
+ 	return conn, nil
+ }
++
++func webSocketDialer(tlsEnabled bool, component string) func(context.Context, string) (net.Conn, error) {
++	scheme := "ws"
++	if tlsEnabled {
++		scheme = "wss"
++	}
++	certPool, err := x509.SystemCertPool()
++	if err != nil || certPool == nil {
++		certPool = embeddedroots.Get()
++	}
++	// nbnet's dialer protects the socket on Android, so the control connection never runs inside the tunnel it controls.
++	nbDialer := nbnet.NewDialer()
++	httpClient := &http.Client{Transport: &http.Transport{
++		DialContext:     nbDialer.DialContext,
++		TLSClientConfig: &tls.Config{RootCAs: certPool},
++	}}
++	return func(ctx context.Context, addr string) (net.Conn, error) {
++		c, _, err := websocket.Dial(ctx, scheme+"://"+addr+wsproxy.ProxyPath+component, &websocket.DialOptions{HTTPClient: httpClient})
++		if err != nil {
++			return nil, fmt.Errorf("websocket dial: %w", err)
++		}
++		c.SetReadLimit(-1)
++		log.Infof("gRPC to %s goes through a WebSocket", addr)
++		// The connection outlives the dial's 30 s timeout context.
++		return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
++	}
++}

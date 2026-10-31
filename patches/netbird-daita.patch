@@ -1,0 +1,52 @@
+diff --git a/client/iface/configurer/padding.go b/client/iface/configurer/padding.go
+new file mode 100644
+index 00000000..4f6a8b13
+--- /dev/null
++++ b/client/iface/configurer/padding.go
+@@ -0,0 +1,34 @@
++package configurer
++
++import (
++	"os"
++
++	log "github.com/sirupsen/logrus"
++	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
++)
++
++const (
++	// Newline-separated Maybenot machines; set by Hopper on both ends of its tunnel.
++	envPaddingMachines = "NB_DAITA_MACHINES"
++	envFullSizePackets = "NB_DAITA_FULL_SIZE"
++)
++
++// applyPadding is called on every peer update; a peer whose padding already runs is left alone.
++func applyPadding(dev *device.Device, key wgtypes.Key) {
++	machines := os.Getenv(envPaddingMachines)
++	fullSize := os.Getenv(envFullSizePackets) == "true"
++	if machines == "" && !fullSize {
++		return
++	}
++	peer := dev.LookupPeer(device.NoisePublicKey(key))
++	if peer == nil {
++		return
++	}
++	if peer.SetConstantPacketSize(fullSize) && fullSize {
++		log.Infof("full-size packets on for peer %s", key)
++	}
++	if machines != "" && !peer.DaitaEnabled() && peer.EnableDaita(machines, 1024, 1024, 1.0, 1.0) {
++		log.Infof("padding on for peer %s", key)
++	}
++}
+diff --git a/client/iface/configurer/usp.go b/client/iface/configurer/usp.go
+index 1b0965f0..cc691ff6 100644
+--- a/client/iface/configurer/usp.go
++++ b/client/iface/configurer/usp.go
+@@ -123,6 +123,7 @@ func (c *WGUSPConfigurer) UpdatePeer(peerKey string, allowedIps []netip.Prefix,
+ 	if err := c.device.ConfigurePeer(device.NoisePublicKey(peerKeyParsed), cfg); err != nil {
+ 		return fmt.Errorf("configure peer: %w", err)
+ 	}
++	applyPadding(c.device, peerKeyParsed)
+ 
+ 	if endpoint != nil {
+ 		c.activityRecorder.UpsertAddress(peerKey, addrPort)
