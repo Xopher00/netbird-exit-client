@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The exit servers' NetBird client: v0.81.5 plus the WebSocket patch (stock gRPC cannot pass Cloudflare) and
 # Maybenot padding (off unless NB_DAITA_MACHINES or NB_DAITA_FULL_SIZE is set; Hopper's app/CLAUDE.md), and ECH to the
-# host in NB_ECH_HOST.
-# Output: worker/dl/netbird-0.81.5-hopper.gz and worker/dl/SHA256SUMS, served by the Worker as static assets.
+# host in NB_ECH_HOST, and the answer sent before ICE gathering starts (netbird-answer-first.patch).
+# Output: build/netbird-0.81.5-hopper.gz and build/SHA256SUMS, for publish-client.sh.
 set -euo pipefail
 
 NB_VERSION=v0.81.5
@@ -17,12 +17,12 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 # The patches live in the Android app next to this server folder.
 HOPPER_APP=${HOPPER_APP:-$(cd "$repo/.." && pwd)/app}
 build=$repo/build
-dl=$repo/worker/dl
+dl=$build
 wt=$build/netbird-client-src
 wgwt=$build/wireguard-go-src
 mkdir -p "$build" "$dl"
 
-for patch in netbird-grpc-websocket.patch netbird-daita.patch netbird-ech.patch wireguard-daita.patch; do
+for patch in netbird-grpc-websocket.patch netbird-daita.patch netbird-ech.patch netbird-answer-first.patch wireguard-daita.patch; do
   [ -f "$HOPPER_APP/$patch" ] || { echo "patch not found: $HOPPER_APP/$patch" >&2; exit 1; }
 done
 git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
@@ -44,7 +44,7 @@ git -C "$NB_SRC" worktree add --detach "$wt" "$NB_VERSION" >/dev/null
 git -C "$WG_SRC" worktree add --detach "$wgwt" "$WG_COMMIT" >/dev/null
 trap cleanup EXIT
 [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "worktree is not clean" >&2; exit 1; }
-git -C "$wt" apply "$HOPPER_APP/netbird-grpc-websocket.patch" "$HOPPER_APP/netbird-daita.patch" "$HOPPER_APP/netbird-ech.patch"
+git -C "$wt" apply "$HOPPER_APP/netbird-grpc-websocket.patch" "$HOPPER_APP/netbird-daita.patch" "$HOPPER_APP/netbird-ech.patch" "$HOPPER_APP/netbird-answer-first.patch"
 git -C "$wgwt" apply "$HOPPER_APP/wireguard-daita.patch"
 git -C "$wt" diff --stat
 
