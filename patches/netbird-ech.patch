@@ -1,3 +1,17 @@
+--- a/client/net/protectsocket_android.go
++++ b/client/net/protectsocket_android.go
+@@ -28,10 +28,10 @@
+ 	err := c.Control(func(fd uintptr) {
+ 		androidProtectSocketLock.Lock()
+ 		defer androidProtectSocketLock.Unlock()
+
+ 		if androidProtectSocket == nil {
+-			aErr = fmt.Errorf("socket protection function not set")
++			// No tunnel has run in this process, so there is no tun to escape: send it plainly.
+ 			return
+ 		}
+
+ 		if !androidProtectSocket(int32(fd)) {
 --- a/client/grpc/dialer.go
 +++ b/client/grpc/dialer.go
 @@ -20,6 +20,7 @@

@@ -8,10 +8,10 @@ index e460293..828c27c 100644
 +maybenot-ffi/lib/
 diff --git a/device/daita.go b/device/daita.go
 new file mode 100644
-index 0000000..480f5ed
+index 0000000..e576a35
 --- /dev/null
 +++ b/device/daita.go
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,703 @@
 +//go:build daita
 +// +build daita
 +
@@ -20,6 +20,7 @@ index 0000000..480f5ed
 +import (
 +	"encoding/binary"
 +	"sync"
++	"sync/atomic"
 +	"time"
 +	"unsafe"
 +)
@@ -46,6 +47,26 @@ index 0000000..480f5ed
 +	logger          *Logger
 +	stopping        sync.WaitGroup // waitgroup for runEventLoop and HandleDaitaActions
 +	loopDone        chan struct{}
++
++	// Blocking (the Maybenot BlockOutgoing action) is global per the framework's model: one block
++	// state per peer, BlockingBegin on the first active block, BlockingEnd when the last ends. The
++	// hot path reads blockCount/blockBypass without the mutex.
++	blocksMu       sync.Mutex
++	blocks         map[uint64]blockState  // machine -> its active block
++	blockScheduled map[uint64]*time.Timer // machine -> pending scheduled block
++	blockEnd       map[uint64]*time.Timer // machine -> the timer that ends its active block
++	blockCount     atomic.Int32
++	blockBypass    atomic.Bool
++	heldMu         sync.Mutex
++	held           []*QueueOutboundElement
++	holder         *Peer // set at EnableDaita: Close uses it to return held packets to the pools
++}
++
++// blockState is one machine's active block. bypass says whether bypass-flagged padding may still be
++// sent during it.
++type blockState struct {
++	deadline time.Time
++	bypass   bool
 +}
 +
 +type MachineTimer struct {
@@ -73,6 +94,10 @@ index 0000000..480f5ed
 +const (
 +	ERROR_GENERAL_FAILURE      = -1
 +	ERROR_INTERMITTENT_FAILURE = -2
++
++	// blockHoldCap bounds the packets a Maybenot block holds: past it, outgoing traffic flows through
++	// fail-open (a blocked peer under load degrades to unprotected instead of breaking or pinning memory).
++	blockHoldCap = 1024
 +)
 +
 +// TODO: Consider using an Action interface, and defining MaybenotDaita.handleEvents as a method on
@@ -137,15 +162,19 @@ index 0000000..480f5ed
 +
 +	numMachines := C.maybenot_num_machines(maybenot)
 +	daita := MaybenotDaita{
-+		events:        make(chan Event, eventsCapacity),
-+		eventsCBuf:    make([]C.MaybenotEvent, eventsCapacity),
-+		eventsClosed:  false,
-+		maybenot:      maybenot,
-+		newActionsBuf: make([]C.MaybenotAction, numMachines),
-+		paddingQueue:  map[uint64]*time.Timer{},
-+		machineTimers: map[uint64]*MachineTimer{},
-+		logger:        peer.device.log,
-+		loopDone:      make(chan struct{}),
++		events:         make(chan Event, eventsCapacity),
++		eventsCBuf:     make([]C.MaybenotEvent, eventsCapacity),
++		eventsClosed:   false,
++		maybenot:       maybenot,
++		newActionsBuf:  make([]C.MaybenotAction, numMachines),
++		paddingQueue:   map[uint64]*time.Timer{},
++		machineTimers:  map[uint64]*MachineTimer{},
++		holder:         peer,
++		blocks:         map[uint64]blockState{},
++		blockScheduled: map[uint64]*time.Timer{},
++		blockEnd:       map[uint64]*time.Timer{},
++		logger:         peer.device.log,
++		loopDone:       make(chan struct{}),
 +	}
 +
 +	daita.stopping.Add(1)
@@ -160,6 +189,20 @@ index 0000000..480f5ed
 +// Stop the MaybenotDaita instance. It must not be used after calling this.
 +func (daita *MaybenotDaita) Close() {
 +	daita.logger.Verbosef("Waiting for DAITA routines to stop")
++
++	// Block timers are tracked like the padding queue: stopped ones decrement the waitgroup here.
++	daita.blocksMu.Lock()
++	for _, timer := range daita.blockScheduled {
++		if timer.Stop() {
++			daita.stopping.Done()
++		}
++	}
++	for _, timer := range daita.blockEnd {
++		if timer.Stop() {
++			daita.stopping.Done()
++		}
++	}
++	daita.blocksMu.Unlock()
 +
 +	daita.eventsCloseLock.Lock()
 +	close(daita.events)
@@ -181,6 +224,9 @@ index 0000000..480f5ed
 +		}
 +	}
 +	daita.stopping.Wait()
++	if daita.holder != nil {
++		daita.dropHeld(daita.holder)
++	}
 +	daita.logger.Verbosef("DAITA routines have stopped")
 +}
 +
@@ -250,7 +296,7 @@ index 0000000..480f5ed
 +		return
 +	}
 +
-+	if action.Replace && peer.HasReplaceablePackets() {
++	if action.Replace && peer.HasReplaceablePackets() && daita.maySend(action.Bypass) {
 +		peer.ReplacedPacketsInc()
 +		daita.PaddingSent(peer, action.Machine)
 +		return
@@ -286,6 +332,12 @@ index 0000000..480f5ed
 +	binary.BigEndian.PutUint16(elem.packet[DaitaOffsetTotalLength:DaitaOffsetTotalLength+2], size)
 +
 +	elems.elems = append(elems.elems, elem)
++	// A block with bypass holds non-bypass padding for release with the real packets; bypass-flagged
++	// padding leaves at once (it is the confounder a blocking defense sends while it holds traffic).
++	if !daita.maySend(action.Bypass) && daita.holdPadding(elem, action.Machine) {
++		peer.device.PutOutboundElementsContainer(elems)
++		return // PaddingSent fires at the release, when the packet actually leaves
++	}
 +	peer.StagePackets(elems)
 +	peer.sendStagedPackets(false)
 +	daita.PaddingSent(peer, action.Machine)
@@ -369,8 +421,7 @@ index 0000000..480f5ed
 +					injectPadding(action, peer)
 +				})
 +		case C.MaybenotAction_BlockOutgoing:
-+			// TODO: implement BlockOutgoing
-+			daita.logger.Errorf("ignoring BlockOutgoing action, unimplemented")
++			daita.scheduleBlock(action, peer)
 +		case C.MaybenotAction_UpdateTimer:
 +			// Check if a padding packet was already queued for the machine
 +			timer, timerWasQueued := daita.machineTimers[action.Machine]
@@ -404,6 +455,176 @@ index 0000000..480f5ed
 +					})
 +			}
 +		}
++	}
++}
++
++// scheduleBlock (re)arms the machine's pending block timer: last wins. When it fires, the block begins.
++func (daita *MaybenotDaita) scheduleBlock(action Action, peer *Peer) {
++	daita.blocksMu.Lock()
++	timer, was := daita.blockScheduled[action.Machine]
++	if !was || !timer.Stop() {
++		// no pending timer (or it already fired): the new timer's Done needs a fresh Add
++		daita.stopping.Add(1)
++	}
++	daita.blockScheduled[action.Machine] = time.AfterFunc(action.Timeout, func() {
++		defer daita.stopping.Done()
++		daita.fireBlock(action, peer)
++	})
++	daita.blocksMu.Unlock()
++}
++
++// fireBlock starts or replaces the machine's block. Blocking is global per the framework's model: the
++// first active block emits BlockingBegin{machine} and BlockingEnd comes only when the last one ends.
++// A replace block always proceeds (the framework allows it during active blocking); without replace,
++// a second block from the same machine is dropped. The end timer carries its deadline: a later extend
++// replaces the timer, and a stale firing checks against the map before ending anything.
++func (daita *MaybenotDaita) fireBlock(action Action, peer *Peer) {
++	daita.blocksMu.Lock()
++	if _, was := daita.blocks[action.Machine]; was && !action.Replace {
++		daita.blocksMu.Unlock()
++		return
++	}
++	wasEmpty := len(daita.blocks) == 0
++	deadline := time.Now().Add(action.Duration)
++	daita.blocks[action.Machine] = blockState{deadline: deadline, bypass: action.Bypass}
++	daita.blockCount.Store(int32(len(daita.blocks)))
++	allBypass := true
++	for _, b := range daita.blocks {
++		if !b.bypass {
++			allBypass = false
++		}
++	}
++	daita.blockBypass.Store(allBypass)
++	// the end timer lives in the same critical section: Close iterates these maps under blocksMu
++	timer, was := daita.blockEnd[action.Machine]
++	if !was || !timer.Stop() {
++		daita.stopping.Add(1)
++	}
++	thisDeadline := deadline
++	daita.blockEnd[action.Machine] = time.AfterFunc(action.Duration, func() {
++		defer daita.stopping.Done()
++		daita.endBlock(action.Machine, thisDeadline, peer)
++	})
++	daita.blocksMu.Unlock()
++	if wasEmpty {
++		daita.event(peer, BlockingBegin, action.Machine)
++	}
++}
++
++// endBlock ends the machine's block if its deadline is still the current one (an extend replaced the
++// timer). BlockingEnd comes only when the last active block ended, followed by the release of every
++// held packet as one burst.
++func (daita *MaybenotDaita) endBlock(machine uint64, deadline time.Time, peer *Peer) {
++	daita.blocksMu.Lock()
++	if cur, was := daita.blocks[machine]; !was || !cur.deadline.Equal(deadline) {
++		daita.blocksMu.Unlock()
++		return
++	}
++	delete(daita.blocks, machine)
++	daita.blockCount.Store(int32(len(daita.blocks)))
++	last := len(daita.blocks) == 0
++	daita.blocksMu.Unlock()
++	if last {
++		daita.event(peer, BlockingEnd, 0)
++		daita.releaseHeld(peer)
++	}
++}
++
++// isBlocked reports whether the peer currently holds outgoing traffic.
++func (daita *MaybenotDaita) isBlocked() bool { return daita.blockCount.Load() > 0 }
++
++// maySend reports whether a padding action may leave during an active block: a block with bypass lets
++// bypass-flagged padding through, and everything else is held to merge with the release.
++func (daita *MaybenotDaita) maySend(bypass bool) bool {
++	return !daita.isBlocked() || (bypass && daita.blockBypass.Load())
++}
++
++// blockHolds takes a TUN batch into the hold queue and reports whether it was held. The hold is bounded
++// (blockHoldCap packets): past the cap the batch flows through unpadded rather than losing packets or
++// pinning memory - a blocked peer under load degrades to unprotected instead of breaking.
++func (daita *MaybenotDaita) blockHolds(elems []*QueueOutboundElement) bool {
++	if daita.blockCount.Load() == 0 {
++		return false
++	}
++	daita.heldMu.Lock()
++	defer daita.heldMu.Unlock()
++	// re-check under the lock: a hold decided before the block ended must not append into a drained
++	// queue and strand there until the next block
++	if daita.blockCount.Load() == 0 || len(daita.held) >= blockHoldCap {
++		return false
++	}
++	daita.held = append(daita.held, elems...)
++	return true
++}
++
++// holdPadding takes a built padding packet into the hold queue while a block holds it, and reports
++// whether it was held (false: the hold is full, the padding leaves at once like the fail-open path).
++func (daita *MaybenotDaita) holdPadding(elem *QueueOutboundElement, machine uint64) bool {
++	daita.heldMu.Lock()
++	defer daita.heldMu.Unlock()
++	// the same re-check as blockHolds: the block may have ended between the maySend test and here
++	if daita.blockCount.Load() == 0 || len(daita.held) >= blockHoldCap {
++		return false
++	}
++	daita.held = append(daita.held, elem)
++	return true
++}
++
++// releaseHeld sends every held packet as one burst at the end of the last active block. NormalSent
++// fires here, not at the TUN read: the machines must see the packets as sent when they actually are,
++// and held padding fires PaddingSent here for the same reason.
++func (daita *MaybenotDaita) releaseHeld(peer *Peer) {
++	daita.heldMu.Lock()
++	held := daita.held
++	daita.held = nil
++	daita.heldMu.Unlock()
++	for len(held) > 0 {
++		n := len(held)
++		if n > 128 {
++			n = 128
++		}
++		batch := held[:n]
++		held = held[n:]
++		if !peer.isRunning.Load() {
++			for _, elem := range batch {
++				peer.device.PutMessageBuffer(elem.buffer)
++				peer.device.PutOutboundElement(elem)
++			}
++			continue
++		}
++		container, ok := peer.device.TryGetOutboundElementsContainer()
++		if !ok {
++			// fail-open: no container from the pool, the held packets leave one by one
++			for _, elem := range batch {
++				if one, ok1 := peer.device.TryGetOutboundElementsContainer(); ok1 {
++					one.elems = append(one.elems, elem)
++					peer.StagePackets(one)
++				}
++			}
++			continue
++		}
++		container.elems = append(container.elems, batch...)
++		peer.StagePackets(container)
++		peer.SendStagedPackets()
++		for _, elem := range batch {
++			if elem.daitaPadding {
++				daita.PaddingSent(peer, elem.daitaMachine)
++			} else {
++				daita.NormalSent(peer)
++			}
++		}
++	}
++}
++
++// dropHeld discards held packets (peer stopped or reset): their buffers return to the pools.
++func (daita *MaybenotDaita) dropHeld(peer *Peer) {
++	daita.heldMu.Lock()
++	held := daita.held
++	daita.held = nil
++	daita.heldMu.Unlock()
++	for _, elem := range held {
++		peer.device.PutMessageBuffer(elem.buffer)
++		peer.device.PutOutboundElement(elem)
 +	}
 +}
 +
@@ -496,10 +717,10 @@ index 0000000..480f5ed
 +}
 diff --git a/device/daita_peer.go b/device/daita_peer.go
 new file mode 100644
-index 0000000..b099bb7
+index 0000000..51ccd68
 --- /dev/null
 +++ b/device/daita_peer.go
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,64 @@
 +package device
 +
 +// Counts of packets queued for a peer that a DAITA padding action with the replace flag may stand in for.
@@ -542,6 +763,9 @@ index 0000000..b099bb7
 +func (peer *Peer) resetOutboundAndReplaced() {
 +	peer.outboundPackets.Store(0)
 +	peer.replacedPackets.Store(0)
++	if d := peer.getDaita(); d != nil {
++		d.dropHeld(peer)
++	}
 +}
 +
 +func (peer *Peer) closeDaita() {
@@ -577,10 +801,10 @@ index 0000000..de0c096
 +}
 diff --git a/device/daita_test.go b/device/daita_test.go
 new file mode 100644
-index 0000000..bcb8392
+index 0000000..d687205
 --- /dev/null
 +++ b/device/daita_test.go
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,223 @@
 +//go:build daita
 +
 +package device
@@ -598,6 +822,9 @@ index 0000000..bcb8392
 +
 +// MACHINES names a directory of <name>.txt machine files (Hopper's app/src/main/assets/padding).
 +func machinesFor(t *testing.T, name string) string {
++	if b, err := os.ReadFile(filepath.Join("testdata", name+".txt")); err == nil {
++		return strings.TrimSpace(string(b))
++	}
 +	dir := os.Getenv("MACHINES")
 +	if dir == "" {
 +		t.Skip("MACHINES not set")
@@ -740,6 +967,46 @@ index 0000000..bcb8392
 +	}
 +}
 +
++// A Maybenot block holds outgoing real traffic and releases it at the block's end: every packet must
++// still reach the application (blocking delays, never drops), and the release counts as the packets'
++// send so the machines see them. The test machine blocks 200 ms on each NormalSent, one-sided.
++func TestDaitaBlocking(t *testing.T) {
++	cm := machinesFor(t, "block_test_client")
++	base := pageLoads(t, func(cli, srv *Peer) {})
++	w := pageLoads(t, func(cli, srv *Peer) { enable(t, cli, cm) })
++	if w.delivered != w.sent {
++		t.Errorf("blocking lost packets: delivered %d of sent %d", w.delivered, w.sent)
++	}
++	if w.cliTx+w.srvTx < base.cliTx+base.srvTx {
++		t.Errorf("blocked traffic lost bytes on the wire: %d against %d", w.cliTx+w.srvTx, base.cliTx+base.srvTx)
++	}
++}
++
++// Peer.Stop must not hang with a block active, and held packets must not leak: their buffers return
++// to the pools.
++func TestDaitaStopsWithBlockActive(t *testing.T) {
++	cm := machinesFor(t, "block_test_client")
++	pair := genTestPair(t, true)
++	for _, p := range pair[0].dev.peers.keyMap {
++		enable(t, p, cm)
++		pair[0].tun.Outbound <- udpPacket(pair[0].ip, pair[1].ip, 300)
++		time.Sleep(50 * time.Millisecond) // the block fires and holds the packet
++		if d := p.getDaita(); d == nil || !d.(*MaybenotDaita).isBlocked() {
++			t.Skip("the block did not fire; the stop assert would test nothing")
++		}
++		done := make(chan struct{})
++		go func() { p.Stop(); close(done) }()
++		select {
++		case <-done:
++		case <-time.After(5 * time.Second):
++			t.Fatal("Peer.Stop hung with a block active")
++		}
++		if p.DaitaEnabled() {
++			t.Fatal("DAITA still on after Stop")
++		}
++	}
++}
++
 +// A full-size keepalive would read as data at the receiver, which answers it: the tunnel would never go quiet.
 +func TestConstantPacketSizeKeepsKeepalivesSmall(t *testing.T) {
 +	pair := genTestPair(t, true)
@@ -763,10 +1030,10 @@ index 0000000..bcb8392
 +}
 diff --git a/device/daita_types.go b/device/daita_types.go
 new file mode 100644
-index 0000000..cfd255d
+index 0000000..584f197
 --- /dev/null
 +++ b/device/daita_types.go
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,77 @@
 +package device
 +
 +type EventType uint32
@@ -805,6 +1072,17 @@ index 0000000..cfd255d
 +	PaddingReceived(peer *Peer)
 +	TunnelSent(peer *Peer)
 +	TunnelReceived(peer *Peer)
++
++	// Blocking (the Maybenot BlockOutgoing action): blockHolds takes a TUN batch into the hold queue
++	// while a block is active (false: not blocked, or the hold is full and the batch flows through);
++	// maySend reports whether padding with the bypass flag may leave during the block; holdPadding takes a built
++	// padding packet into the hold; releaseHeld sends every held packet at the block's end; dropHeld
++	// discards them (peer stopped or reset).
++	blockHolds(elems []*QueueOutboundElement) bool
++	maySend(bypass bool) bool
++	holdPadding(elem *QueueOutboundElement, machine uint64) bool
++	releaseHeld(peer *Peer)
++	dropHeld(peer *Peer)
 +}
 +
 +func (event EventType) String() string {
@@ -922,10 +1200,10 @@ index 1392957..f324ef1 100644
  		}
  
 diff --git a/device/send.go b/device/send.go
-index 010f1ac..505cef2 100644
+index 010f1ac..f3b1eb0 100644
 --- a/device/send.go
 +++ b/device/send.go
-@@ -51,6 +51,10 @@ type QueueOutboundElement struct {
+@@ -51,6 +51,11 @@ type QueueOutboundElement struct {
  	nonce   uint64                // nonce for encryption
  	keypair *Keypair              // keypair for encryption
  	peer    *Peer                 // related peer
@@ -933,28 +1211,31 @@ index 010f1ac..505cef2 100644
 +	countedFor   *Peer // set while the packet counts in countedFor's replaceable packets
 +	keepalive    bool
 +	daitaPadding bool
++	daitaMachine uint64 // held padding: the machine that requested it, fired as PaddingSent at release
  }
  
  type QueueOutboundElementsContainer struct {
-@@ -62,6 +66,8 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
+@@ -62,6 +67,9 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
  	elem := device.GetOutboundElement()
  	elem.buffer = device.GetMessageBuffer()
  	elem.nonce = 0
 +	elem.keepalive = false
 +	elem.daitaPadding = false
++	elem.daitaMachine = 0
  	// keypair and peer were cleared (if necessary) by clearPointers.
  	return elem
  }
-@@ -80,6 +86,8 @@ func (device *Device) TryNewOutboundElement() (*QueueOutboundElement, bool) {
+@@ -80,6 +88,9 @@ func (device *Device) TryNewOutboundElement() (*QueueOutboundElement, bool) {
  	}
  	elem.buffer = buffer
  	elem.nonce = 0
 +	elem.keepalive = false
 +	elem.daitaPadding = false
++	elem.daitaMachine = 0
  	// keypair and peer were cleared (if necessary) by clearPointers.
  	return elem, true
  }
-@@ -112,6 +120,7 @@ func (elem *QueueOutboundElement) clearPointers() {
+@@ -112,6 +123,7 @@ func (elem *QueueOutboundElement) clearPointers() {
  	elem.packet = nil
  	elem.keypair = nil
  	elem.peer = nil
@@ -962,7 +1243,7 @@ index 010f1ac..505cef2 100644
  }
  
  /* Queues a keepalive if no packets are queued for peer.
-@@ -148,6 +157,8 @@ func (peer *Peer) stageKeepalive() {
+@@ -148,6 +160,8 @@ func (peer *Peer) stageKeepalive() {
  		peer.device.log.Verbosef("%v - Skipping keepalive, buffer pool exhausted", peer)
  		return
  	}
@@ -971,13 +1252,23 @@ index 010f1ac..505cef2 100644
  	elemsContainer.elems = append(elemsContainer.elems, elem)
  	select {
  	case peer.queue.staged <- elemsContainer:
-@@ -380,8 +391,17 @@ func (device *Device) RoutineReadFromTUN() {
+@@ -380,8 +394,27 @@ func (device *Device) RoutineReadFromTUN() {
  
  		for peer, elemsForPeer := range elemsByPeer {
  			if peer.isRunning.Load() {
 +				n := len(elemsForPeer.elems)
-+				for _, elem := range elemsForPeer.elems {
-+					peer.countOutbound(elem)
++				// A Maybenot block holds outgoing real traffic and releases it as one burst at the
++				// block's end (NormalSent fires then): blocking merges real packets with the padding
++				// the machines send while the block holds. The container goes back to the pool; the
++				// held elements keep their buffers until release.
++				if daita := peer.getDaita(); daita != nil {
++					for _, elem := range elemsForPeer.elems {
++						peer.countOutbound(elem)
++					}
++					if daita.blockHolds(elemsForPeer.elems) {
++						device.PutOutboundElementsContainer(elemsForPeer)
++						continue
++					}
 +				}
  				peer.StagePackets(elemsForPeer)
  				peer.SendStagedPackets()
@@ -989,7 +1280,7 @@ index 010f1ac..505cef2 100644
  			} else {
  				for _, elem := range elemsForPeer.elems {
  					device.PutMessageBuffer(elem.buffer)
-@@ -497,6 +517,10 @@ top:
+@@ -497,6 +530,10 @@ top:
  					i++
  				}
  
@@ -1000,7 +1291,7 @@ index 010f1ac..505cef2 100644
  				elem.keypair = keypair
  			}
  			elemsContainer.Lock()
-@@ -565,6 +589,18 @@ func (peer *Peer) FlushStagedPackets() {
+@@ -565,6 +602,18 @@ func (peer *Peer) FlushStagedPackets() {
  	}
  }
  
@@ -1019,7 +1310,7 @@ index 010f1ac..505cef2 100644
  func calculatePaddingSize(packetSize, mtu int) int {
  	lastUnit := packetSize
  	if mtu == 0 {
-@@ -662,7 +698,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
+@@ -662,7 +711,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
  		}
  		dataSent := false
  		for _, elem := range elemsContainer.elems {
@@ -1028,7 +1319,7 @@ index 010f1ac..505cef2 100644
  				dataSent = true
  			}
  			bufs = append(bufs, elem.packet)
-@@ -675,6 +711,11 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
+@@ -675,6 +724,11 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
  		if dataSent {
  			peer.timersDataSent()
  		}
@@ -1040,6 +1331,13 @@ index 010f1ac..505cef2 100644
  		for _, elem := range elemsContainer.elems {
  			device.PutMessageBuffer(elem.buffer)
  			device.PutOutboundElement(elem)
+diff --git a/device/testdata/block_test_client.txt b/device/testdata/block_test_client.txt
+new file mode 100644
+index 0000000..18a4cfe
+--- /dev/null
++++ b/device/testdata/block_test_client.txt
+@@ -0,0 +1 @@
++02eNqNzLENACAMA7CkE19VvMMVnMwDCFBpBySGekmUIXM5mKGMIreQZ+mKQCGR00p98sve/H8DfwgORQ==
 diff --git a/maybenot-ffi/Cargo.lock b/maybenot-ffi/Cargo.lock
 new file mode 100644
 index 0000000..eacda0d
