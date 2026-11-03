@@ -20,7 +20,6 @@ export PATH=$GO_ROOT/bin:$PATH
 if [ -d "$here/patches" ]; then pdir=$here/patches; build=${BUILD_DIR:-$here/../server/build}
 else pdir=$here; build=${BUILD_DIR:-$here/../build}; fi
 mkdir -p "$build"; build=$(cd "$build" && pwd)
-dl=$build
 wt=$build/netbird-client-src
 wgwt=$build/wireguard-go-src
 
@@ -65,9 +64,9 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "daita netgo osus
   -o "$build/$NAME" ./client > "$build/$NAME.log" 2>&1 || { cat "$build/$NAME.log" >&2; exit 1; }
 file "$build/$NAME" | grep -q "statically linked" || { echo "$NAME is not statically linked" >&2; exit 1; }
 
-gzip -9 -n -c "$build/$NAME" > "$dl/$NAME.gz"
+gzip -9 -n -c "$build/$NAME" > "$build/$NAME.gz"
 (cd "$build" && sha256sum "$NAME") > "$build/$NAME.sha256"
 # One client per NetBird version: each build replaces the file and its sums.
-(cd "$dl" && sha256sum "$NAME.gz" && cat "$build/$NAME.sha256") > "$dl/SHA256SUMS"
-ls -l "$dl/$NAME.gz"
-cat "$dl/SHA256SUMS"
+(cd "$build" && sha256sum "$NAME.gz" && cat "$build/$NAME.sha256") > "$build/SHA256SUMS"
+ls -l "$build/$NAME.gz"
+cat "$build/SHA256SUMS"
