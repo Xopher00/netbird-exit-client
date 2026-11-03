@@ -83,7 +83,7 @@
  	tlsClientConfig := quictls.ClientQUICTLSConfig()
 --- /dev/null
 +++ b/client/net/ech/ech.go
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,280 @@
 +// Package ech connects to one host with Encrypted Client Hello, looking the host up over DNS over HTTPS, so its
 +// name appears neither in DNS nor in the TLS handshake. Hopper sets NB_ECH_HOST to its own server's host.
 +package ech
@@ -259,6 +259,8 @@
 +	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
 +		DialContext:     dial,
 +		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
++		// This transport lasts one lookup, so an idle connection would stay open with nothing to reuse it.
++		DisableKeepAlives: true,
 +	}}
 +	type result struct {
 +		rrs []dns.RR
@@ -364,7 +366,7 @@
 +}
 --- /dev/null
 +++ b/client/net/ech/ech_test.go
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,196 @@
 +package ech
 +
 +import (
@@ -506,6 +508,43 @@
 +	if c, err := dial(t, addr, pool); err == nil {
 +		c.Close()
 +		t.Fatal("connected without ECH")
++	}
++}
++
++type countedConn struct {
++	net.Conn
++	closed *atomic.Int32
++}
++
++func (c countedConn) Close() error {
++	c.closed.Add(1)
++	return c.Conn.Close()
++}
++
++func TestLookupLeavesNoConnectionOpen(t *testing.T) {
++	_, list, _ := echConfig(t)
++	fakeDoH(t, list)
++	var opened, closed atomic.Int32
++	d := &net.Dialer{}
++	counting := func(ctx context.Context, network, addr string) (net.Conn, error) {
++		c, err := d.DialContext(ctx, network, addr)
++		if err != nil {
++			return nil, err
++		}
++		opened.Add(1)
++		return countedConn{c, &closed}, nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	if _, err := lookup(ctx, counting, "example.com"); err != nil {
++		t.Fatal(err)
++	}
++	limit := time.Now().Add(3 * time.Second)
++	for closed.Load() < opened.Load() && time.Now().Before(limit) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if o, c := opened.Load(), closed.Load(); o == 0 || c < o {
++		t.Fatalf("%d connections opened, %d closed", o, c)
 +	}
 +}
 +

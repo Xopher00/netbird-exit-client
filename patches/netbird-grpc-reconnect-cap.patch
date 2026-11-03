@@ -1,0 +1,88 @@
+diff --git a/client/grpc/dialer.go b/client/grpc/dialer.go
+index 9d2e4db8..88d811fb 100644
+--- a/client/grpc/dialer.go
++++ b/client/grpc/dialer.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/coder/websocket"
+ 	log "github.com/sirupsen/logrus"
+ 	"google.golang.org/grpc"
++	grpcbackoff "google.golang.org/grpc/backoff"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/keepalive"
+@@ -25,6 +26,13 @@ import (
+ 	"github.com/netbirdio/netbird/util/wsproxy"
+ )
+ 
++// reconnectParams keeps gRPC's defaults except the wait: its 120 s leaves a client waiting long after a sleeping server
++// wakes. WithConnectParams replaces the dial time too; without MinConnectTimeout a dial gets only the backoff, 1 s at first.
++var reconnectParams = grpc.ConnectParams{
++	Backoff:           grpcbackoff.Config{BaseDelay: time.Second, Multiplier: 1.6, Jitter: 0.2, MaxDelay: 30 * time.Second},
++	MinConnectTimeout: 20 * time.Second,
++}
++
+ // Backoff returns a backoff configuration for gRPC calls
+ func Backoff(ctx context.Context) backoff.BackOff {
+ 	b := backoff.NewExponentialBackOff()
+@@ -61,6 +69,7 @@ func CreateConnection(ctx context.Context, addr string, tlsEnabled bool, compone
+ 			Time:    30 * time.Second,
+ 			Timeout: 10 * time.Second,
+ 		}),
++		grpc.WithConnectParams(reconnectParams),
+ 	}
+ 	opts = append(opts, extraOpts...)
+ 	// Through a proxy that does not pass HTTP/2 to the server, carry gRPC inside the server's WebSocket wrapper.
+diff --git a/client/grpc/dialer_reconnect_test.go b/client/grpc/dialer_reconnect_test.go
+new file mode 100644
+index 00000000..78902f1f
+--- /dev/null
++++ b/client/grpc/dialer_reconnect_test.go
+@@ -0,0 +1,48 @@
++package grpc
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"google.golang.org/grpc"
++)
++
++func TestReconnectWaitIsCappedWithJitter(t *testing.T) {
++	if got := reconnectParams.Backoff.MaxDelay; got != 30*time.Second {
++		t.Fatalf("reconnect cap = %v, want 30s", got)
++	}
++	if reconnectParams.Backoff.Jitter <= 0 {
++		t.Fatal("reconnect wait lost its jitter: clients would retry in step")
++	}
++}
++
++// A dial through a WebSocket with a DNS-over-HTTPS lookup can take longer than the first backoff of 1 s.
++func TestDialKeepsItsTimeWithTheShortFirstBackoff(t *testing.T) {
++	var mu sync.Mutex
++	var left time.Duration
++	dialer := grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
++		if d, ok := ctx.Deadline(); ok {
++			mu.Lock()
++			left = time.Until(d)
++			mu.Unlock()
++		}
++		return nil, errors.New("refused")
++	})
++
++	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++	defer cancel()
++	if conn, err := CreateConnection(ctx, "passthrough:///test", false, "/test", dialer); err == nil {
++		conn.Close()
++		t.Fatal("dial should not succeed")
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if left < 15*time.Second {
++		t.Fatalf("first dial got %v, want gRPC's 20 s", left)
++	}
++}

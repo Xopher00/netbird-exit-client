@@ -1,10 +1,19 @@
 # Hopper's NetBird patches, in apply order (later ones build on earlier ones).
-# Second word on: phone = the app's library (app/build-netbird.sh), exit = the exit servers' client
-# (server/scripts/build-client.sh, copied to the public repo by publish-client.sh).
+# Second word on: phone = the app's library (netbird/build-phone.sh), exit = the exit servers' client
+# (netbird/build-client.sh, copied to the public repo by publish-client.sh).
 # A line with "wireguard" applies to the wireguard-go checkout instead of NetBird.
+
+# With NB_GRPC_WEBSOCKET=true, gRPC to a self-hosted server rides its WebSocket wrapper, for hosts behind a proxy that does not pass gRPC.
 netbird-grpc-websocket.patch phone exit
+# Each peer update switches on Maybenot padding when NB_DAITA_MACHINES holds machines, and full-size packets when NB_DAITA_FULL_SIZE=true.
 netbird-daita.patch phone exit
+# Connections to the host in NB_ECH_HOST use ECH after a DNS-over-HTTPS lookup, or are refused; QUIC to it is skipped.
 netbird-ech.patch phone exit
+# The answer goes out before ICE candidates, so a direct link can form in the first round instead of after minutes on the relay. Drop both this and hold-candidates once netbirdio/netbird#8443 is fixed upstream.
 netbird-answer-first.patch phone exit
+# Each new ICE agent gets the remote candidates of the last 5 s.
 netbird-hold-candidates.patch phone exit
+# Caps gRPC's reconnect wait for Management and Signal at 30 s, down from 120 s, so a client reaches a server soon after it wakes.
+netbird-grpc-reconnect-cap.patch phone exit
+# Mullvad's DAITA ported to the batched send path, with the Maybenot BlockOutgoing action; built with Rust maybenot-ffi for arm64.
 wireguard-daita.patch wireguard phone exit

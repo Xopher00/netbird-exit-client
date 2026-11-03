@@ -5,59 +5,53 @@
 # Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish-client.sh.
 set -euo pipefail
 
-NB_VERSION=v0.82.0
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/versions.env"
+source "$here/lib.sh"
 NB_SRC=${NB_SRC:-$HOME/src/netbird}
 WG_SRC=${WG_SRC:-$HOME/src/wireguard-go-nb}
-GO_ROOT=${GO_ROOT:-$HOME/src/go1.26}
+GO_ROOT=${GO_ROOT:-$GO_SERVER}
 NAME=netbird-${NB_VERSION#v}-hopper
 export GOTOOLCHAIN=local
 export PATH=$GO_ROOT/bin:$PATH
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
-# The patches live in the Android app next to this server folder.
-HOPPER_APP=${HOPPER_APP:-$(cd "$repo/.." && pwd)/app}
-build=$repo/build
+# Two layouts: in this repo the patches sit in patches/ next to this script and the output goes to server/build/;
+# in the public repo's patches/ folder everything sits beside this script and the output goes to ../build/.
+if [ -d "$here/patches" ]; then pdir=$here/patches; build=${BUILD_DIR:-$here/../server/build}
+else pdir=$here; build=${BUILD_DIR:-$here/../build}; fi
+mkdir -p "$build"; build=$(cd "$build" && pwd)
 dl=$build
 wt=$build/netbird-client-src
 wgwt=$build/wireguard-go-src
-mkdir -p "$build" "$dl"
 
-# The list is app/patches.list; "wireguard" lines go to the wireguard-go checkout.
-list=$HOPPER_APP/patches.list
-pick() { awk -v b="$1" -v k="$2" '/^#/ || !NF {next} {w=0; n=0; for (i=2; i<=NF; i++) {if ($i=="wireguard") w=1; if ($i==b) n=1} if (n && ((k=="wireguard")==w)) print $1}' "$list" ; }
+list=$here/patches.list
 nb_patches=(); wg_patches=()
-while read -r patch; do nb_patches+=("$HOPPER_APP/$patch"); done < <(pick exit netbird)
-while read -r patch; do wg_patches+=("$HOPPER_APP/$patch"); done < <(pick exit wireguard)
+while read -r patch; do nb_patches+=("$pdir/$patch"); done < <(pick "$list" exit netbird)
+while read -r patch; do wg_patches+=("$pdir/$patch"); done < <(pick "$list" exit wireguard)
 [ -f "$list" ] && [ "${#nb_patches[@]}" -gt 0 ] && [ "${#wg_patches[@]}" -gt 0 ] || { echo "no exit patches in $list" >&2; exit 1; }
 for patch in "${nb_patches[@]}" "${wg_patches[@]}"; do
   [ -f "$patch" ] || { echo "patch not found: $patch" >&2; exit 1; }
 done
 git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
 # Padding goes onto the netbirdio/wireguard-go commit this NetBird release pins.
-WG_COMMIT=$(git -C "$NB_SRC" show "$NB_VERSION:go.mod" | awk '$1 == "github.com/netbirdio/wireguard-go" {print $2; exit}' | sed 's/.*-//')
-[[ "$WG_COMMIT" =~ ^[0-9a-f]{12}$ ]] || { echo "no netbirdio/wireguard-go requirement in $NB_VERSION go.mod" >&2; exit 1; }
+WG_COMMIT=$(wg_commit "$NB_SRC" "$NB_VERSION")
 [ -d "$WG_SRC" ] || git clone -q https://github.com/netbirdio/wireguard-go.git "$WG_SRC"
 git -C "$WG_SRC" rev-parse -q --verify "$WG_COMMIT^{commit}" >/dev/null || { echo "$WG_SRC has no commit $WG_COMMIT" >&2; exit 1; }
 
 cleanup() {
-  git -C "$NB_SRC" worktree remove --force "$wt" 2>/dev/null || true
-  git -C "$WG_SRC" worktree remove --force "$wgwt" 2>/dev/null || true
+  worktree_drop "$NB_SRC" "$wt"
+  worktree_drop "$WG_SRC" "$wgwt"
 }
 cleanup
-rm -rf "$wt" "$wgwt"
-git -C "$NB_SRC" worktree prune
-git -C "$WG_SRC" worktree prune
-git -C "$NB_SRC" worktree add --detach "$wt" "$NB_VERSION" >/dev/null
-git -C "$WG_SRC" worktree add --detach "$wgwt" "$WG_COMMIT" >/dev/null
+worktree_add "$NB_SRC" "$wt" "$NB_VERSION"
+worktree_add "$WG_SRC" "$wgwt" "$WG_COMMIT"
 trap cleanup EXIT
 [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "worktree is not clean" >&2; exit 1; }
 git -C "$wt" apply "${nb_patches[@]}"
 git -C "$wgwt" apply "${wg_patches[@]}"
 git -C "$wt" diff --stat
 
-(cd "$wgwt/maybenot-ffi" && RUSTFLAGS="-C metadata=maybenot-ffi" cargo rustc -q --crate-type=staticlib --release --locked --target x86_64-unknown-linux-gnu --target-dir target)
-mkdir -p "$wgwt/maybenot-ffi/lib/linux_amd64"
-cp "$wgwt/maybenot-ffi/target/x86_64-unknown-linux-gnu/release/libmaybenot_ffi.a" "$wgwt/maybenot-ffi/lib/linux_amd64/libmaybenot.a"
+maybenot_build "$wgwt" x86_64-unknown-linux-gnu target linux_amd64
 
 cd "$wt"
 go mod edit -replace "github.com/netbirdio/wireguard-go=$wgwt"
