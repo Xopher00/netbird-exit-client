@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The exit servers' NetBird client: v0.82.0 plus the WebSocket patch and the 30 s reconnect cap (stock gRPC cannot pass Cloudflare; netbird-grpc-dialer.patch) and
+# The exit servers' NetBird client: v0.82.0 plus the WebSocket patch and the 30 s reconnect cap (stock gRPC cannot pass Cloudflare; netbird-grpc-websocket.patch) and
 # Maybenot padding (off unless NB_DAITA_MACHINES or NB_DAITA_FULL_SIZE is set; Hopper's app/CLAUDE.md), and ECH to the
 # host in NB_ECH_HOST, and the ICE first-round fix (netbird-ice-first-round.patch).
 # Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish.sh.
@@ -25,13 +25,6 @@ wt=$build/exit-client-src
 wgwt=$build/wireguard-go-src
 
 list=$shared/patches.list
-nb_patches=(); wg_patches=()
-while read -r patch; do nb_patches+=("$pdir/$patch"); done < <(pick "$list" exit netbird)
-while read -r patch; do wg_patches+=("$pdir/$patch"); done < <(pick "$list" exit wireguard)
-[ -f "$list" ] && [ "${#nb_patches[@]}" -gt 0 ] && [ "${#wg_patches[@]}" -gt 0 ] || { echo "no exit patches in $list" >&2; exit 1; }
-for patch in "${nb_patches[@]}" "${wg_patches[@]}"; do
-  [ -f "$patch" ] || { echo "patch not found: $patch" >&2; exit 1; }
-done
 git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
 # Padding goes onto the netbirdio/wireguard-go commit this NetBird release pins.
 WG_COMMIT=$(wg_commit "$NB_SRC" "$NB_VERSION")
@@ -47,8 +40,8 @@ worktree_add "$NB_SRC" "$wt" "$NB_VERSION"
 worktree_add "$WG_SRC" "$wgwt" "$WG_COMMIT"
 trap cleanup EXIT
 [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "worktree is not clean" >&2; exit 1; }
-git -C "$wt" apply "${nb_patches[@]}"
-git -C "$wgwt" apply "${wg_patches[@]}"
+apply_patches "$pdir" "$list" exit netbird "$wt"
+apply_patches "$pdir" "$list" exit wireguard "$wgwt"
 git -C "$wt" diff --stat
 
 maybenot_build "$wgwt" x86_64-unknown-linux-gnu target linux_amd64

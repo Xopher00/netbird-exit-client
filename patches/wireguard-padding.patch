@@ -1,0 +1,228 @@
+diff --git a/.gitignore b/.gitignore
+index e460293..828c27c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,3 @@
+ wireguard-go
++maybenot-ffi/target/
++maybenot-ffi/lib/
+diff --git a/device/peer.go b/device/peer.go
+index 1714589..85c4f2a 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -58,6 +58,11 @@ type Peer struct {
+ 	cookieGenerator             CookieGenerator
+ 	trieEntries                 list.List
+ 	persistentKeepaliveInterval atomic.Uint32
++
++	daita              atomic.Pointer[Daita]
++	constantPacketSize atomic.Bool
++	outboundPackets    atomic.Int32
++	replacedPackets    atomic.Int32
+ }
+ 
+ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+@@ -237,6 +242,7 @@ func (peer *Peer) ZeroAndFlushAll() {
+ 	handshake.mutex.Unlock()
+ 
+ 	peer.FlushStagedPackets()
++	peer.resetOutboundAndReplaced()
+ }
+ 
+ func (peer *Peer) ExpireCurrentKeypairs() {
+@@ -268,6 +274,7 @@ func (peer *Peer) Stop() {
+ 
+ 	peer.device.log.Verbosef("%v - Stopping", peer)
+ 
++	peer.closeDaita()
+ 	peer.timersStop()
+ 	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
+ 	peer.queue.inbound.c <- nil
+diff --git a/device/pools.go b/device/pools.go
+index f70e8c6..d77d4c0 100644
+--- a/device/pools.go
++++ b/device/pools.go
+@@ -177,6 +177,9 @@ func (device *Device) TryGetOutboundElement() (*QueueOutboundElement, bool) {
+ }
+ 
+ func (device *Device) PutOutboundElement(elem *QueueOutboundElement) {
++	if elem.countedFor != nil {
++		elem.countedFor.outboundDone()
++	}
+ 	elem.clearPointers()
+ 	device.pool.outboundElements.Put(elem)
+ }
+diff --git a/device/receive.go b/device/receive.go
+index ece6086..5b8a233 100644
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -221,6 +221,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 		}
+ 		for peer, elemsContainer := range elemsByPeer {
+ 			if peer.isRunning.Load() {
++				if daita := peer.getDaita(); daita != nil {
++					for range elemsContainer.elems {
++						daita.TunnelReceived(peer)
++					}
++				}
+ 				peer.queue.inbound.c <- elemsContainer
+ 				device.queue.decryption.c <- elemsContainer
+ 			} else {
+@@ -468,6 +473,15 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
+ 			}
+ 			dataPacketReceived = true
+ 
++			daita := peer.getDaita()
++			if elem.packet[0] == DaitaPaddingMarker && daita != nil {
++				if len(elem.packet) >= int(DaitaHeaderLen) &&
++					int(binary.BigEndian.Uint16(elem.packet[DaitaOffsetTotalLength:DaitaOffsetTotalLength+2])) <= len(elem.packet) {
++					daita.PaddingReceived(peer)
++				}
++				continue
++			}
++
+ 			switch elem.packet[0] >> 4 {
+ 			case 4:
+ 				if len(elem.packet) < ipv4.HeaderLen {
+@@ -507,6 +521,9 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
+ 				continue
+ 			}
+ 
++			if daita != nil {
++				daita.NormalReceived(peer)
++			}
+ 			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+ 		}
+ 
+diff --git a/device/send.go b/device/send.go
+index 9b22d70..b15a458 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -51,6 +51,11 @@ type QueueOutboundElement struct {
+ 	nonce   uint64                // nonce for encryption
+ 	keypair *Keypair              // keypair for encryption
+ 	peer    *Peer                 // related peer
++
++	countedFor   *Peer // set while the packet counts in countedFor's replaceable packets
++	keepalive    bool
++	daitaPadding bool
++	daitaMachine uint64 // held padding: the machine that requested it, fired as PaddingSent at release
+ }
+ 
+ type QueueOutboundElementsContainer struct {
+@@ -62,6 +67,9 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
+ 	elem := device.GetOutboundElement()
+ 	elem.buffer = device.GetMessageBuffer()
+ 	elem.nonce = 0
++	elem.keepalive = false
++	elem.daitaPadding = false
++	elem.daitaMachine = 0
+ 	// keypair and peer were cleared (if necessary) by clearPointers.
+ 	return elem
+ }
+@@ -80,6 +88,9 @@ func (device *Device) TryNewOutboundElement() (*QueueOutboundElement, bool) {
+ 	}
+ 	elem.buffer = buffer
+ 	elem.nonce = 0
++	elem.keepalive = false
++	elem.daitaPadding = false
++	elem.daitaMachine = 0
+ 	// keypair and peer were cleared (if necessary) by clearPointers.
+ 	return elem, true
+ }
+@@ -112,6 +123,7 @@ func (elem *QueueOutboundElement) clearPointers() {
+ 	elem.packet = nil
+ 	elem.keypair = nil
+ 	elem.peer = nil
++	elem.countedFor = nil
+ }
+ 
+ /* Queues a keepalive if no packets are queued for peer.
+@@ -148,6 +160,8 @@ func (peer *Peer) stageKeepalive() {
+ 		peer.device.log.Verbosef("%v - Skipping keepalive, buffer pool exhausted", peer)
+ 		return
+ 	}
++	elem.keepalive = true
++	peer.countOutbound(elem)
+ 	elemsContainer.elems = append(elemsContainer.elems, elem)
+ 	select {
+ 	case peer.queue.staged <- elemsContainer:
+@@ -380,8 +394,27 @@ func (device *Device) RoutineReadFromTUN() {
+ 
+ 		for peer, elemsForPeer := range elemsByPeer {
+ 			if peer.isRunning.Load() {
++				n := len(elemsForPeer.elems)
++				// A Maybenot block holds outgoing real traffic and releases it as one burst at the
++				// block's end (NormalSent fires then): blocking merges real packets with the padding
++				// the machines send while the block holds. The container goes back to the pool; the
++				// held elements keep their buffers until release.
++				if daita := peer.getDaita(); daita != nil {
++					for _, elem := range elemsForPeer.elems {
++						peer.countOutbound(elem)
++					}
++					if daita.blockHolds(elemsForPeer.elems) {
++						device.PutOutboundElementsContainer(elemsForPeer)
++						continue
++					}
++				}
+ 				peer.StagePackets(elemsForPeer)
+ 				peer.SendStagedPackets()
++				if daita := peer.getDaita(); daita != nil {
++					for range n {
++						daita.NormalSent(peer)
++					}
++				}
+ 			} else {
+ 				for _, elem := range elemsForPeer.elems {
+ 					device.PutMessageBuffer(elem.buffer)
+@@ -497,6 +530,10 @@ top:
+ 					i++
+ 				}
+ 
++				// A padded keepalive would read as data at the receiver and be answered, so the tunnel never idles.
++				if peer.constantPacketSize.Load() && !elem.keepalive {
++					padToMTU(elem, int(peer.device.tun.mtu.Load()))
++				}
+ 				elem.keypair = keypair
+ 			}
+ 			elemsContainer.Lock()
+@@ -565,6 +602,18 @@ func (peer *Peer) FlushStagedPackets() {
+ 	}
+ }
+ 
++// padToMTU zero-fills a packet to the tunnel MTU, hiding its size; the receiver trims it by the IP length field.
++func padToMTU(elem *QueueOutboundElement, mtu int) {
++	size := len(elem.packet)
++	if mtu <= size {
++		return
++	}
++	offset := MessageTransportHeaderSize
++	end := min(offset+mtu, len(elem.buffer))
++	elem.packet = elem.buffer[offset:end]
++	clear(elem.packet[size:])
++}
++
+ func calculatePaddingSize(packetSize, mtu int) int {
+ 	lastUnit := packetSize
+ 	if mtu == 0 {
+@@ -662,7 +711,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
+ 		}
+ 		dataSent := false
+ 		for _, elem := range elemsContainer.elems {
+-			if len(elem.packet) != MessageKeepaliveSize {
++			if !elem.keepalive {
+ 				dataSent = true
+ 			}
+ 			bufs = append(bufs, elem.packet)
+@@ -675,6 +724,11 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
+ 		if dataSent {
+ 			peer.timersDataSent()
+ 		}
++		if daita := peer.getDaita(); daita != nil && err == nil {
++			for range bufs {
++				daita.TunnelSent(peer)
++			}
++		}
+ 		for _, elem := range elemsContainer.elems {
+ 			device.PutMessageBuffer(elem.buffer)
+ 			device.PutOutboundElement(elem)

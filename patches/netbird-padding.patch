@@ -1,0 +1,12 @@
+diff --git a/client/iface/configurer/usp.go b/client/iface/configurer/usp.go
+index 2b4f7381..efb8791f 100644
+--- a/client/iface/configurer/usp.go
++++ b/client/iface/configurer/usp.go
+@@ -122,6 +122,7 @@ func (c *WGUSPConfigurer) UpdatePeer(peerKey string, allowedIps []netip.Prefix,
+ 	if err := c.device.ConfigurePeer(wgbackend.NoisePublicKey(peerKeyParsed), cfg); err != nil {
+ 		return fmt.Errorf("configure peer: %w", err)
+ 	}
++	applyPadding(c.device, peerKeyParsed)
+ 
+ 	if endpoint != nil {
+ 		c.activityRecorder.UpsertAddress(peerKey, addrPort)
