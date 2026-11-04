@@ -1,4 +1,4 @@
-# Shared by build-phone.sh and build-client.sh; sourced, not run. Names no deployment.
+# Shared by app/scripts/build-engine.sh and exit-server/scripts/build.sh; sourced, not run. Names no deployment.
 
 # pick LIST BUILD KIND: patch names in LIST marked BUILD; KIND is "wireguard" or "netbird".
 pick() { awk -v b="$2" -v k="$3" '/^#/ || !NF {next} {w=0; n=0; for (i=2; i<=NF; i++) {if ($i=="wireguard") w=1; if ($i==b) n=1} if (n && ((k=="wireguard")==w)) print $1}' "$1" ; }

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# The exit servers' NetBird client: v0.82.0 plus the WebSocket patch (stock gRPC cannot pass Cloudflare) and
+# The exit servers' NetBird client: v0.82.0 plus the WebSocket patch and the 30 s reconnect cap (stock gRPC cannot pass Cloudflare; netbird-grpc-dialer.patch) and
 # Maybenot padding (off unless NB_DAITA_MACHINES or NB_DAITA_FULL_SIZE is set; Hopper's app/CLAUDE.md), and ECH to the
-# host in NB_ECH_HOST, and the two ICE fixes (netbird-answer-first.patch, netbird-hold-candidates.patch).
-# Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish-client.sh.
+# host in NB_ECH_HOST, and the ICE first-round fix (netbird-ice-first-round.patch).
+# Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish.sh.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/versions.env"
-source "$here/lib.sh"
+# Two layouts: in this repo the shared patch set sits in ../../netbird-patches and the output goes to ../build/;
+# in the public repo's patches/ folder everything sits beside this script and the output goes to ../build/.
+if [ -f "$here/../../netbird-patches/versions.env" ]; then shared=$(cd "$here/../../netbird-patches" && pwd); pdir=$shared/patches
+else shared=$here; pdir=$here; fi
+source "$shared/versions.env"
+source "$shared/lib.sh"
 NB_SRC=${NB_SRC:-$HOME/src/netbird}
 WG_SRC=${WG_SRC:-$HOME/src/wireguard-go-nb}
 GO_ROOT=${GO_ROOT:-$GO_SERVER}
@@ -15,15 +19,12 @@ NAME=netbird-${NB_VERSION#v}-hopper
 export GOTOOLCHAIN=local
 export PATH=$GO_ROOT/bin:$PATH
 
-# Two layouts: in this repo the patches sit in patches/ next to this script and the output goes to server/build/;
-# in the public repo's patches/ folder everything sits beside this script and the output goes to ../build/.
-if [ -d "$here/patches" ]; then pdir=$here/patches; build=${BUILD_DIR:-$here/../server/build}
-else pdir=$here; build=${BUILD_DIR:-$here/../build}; fi
+build=${BUILD_DIR:-$here/../build}
 mkdir -p "$build"; build=$(cd "$build" && pwd)
-wt=$build/netbird-client-src
+wt=$build/exit-client-src
 wgwt=$build/wireguard-go-src
 
-list=$here/patches.list
+list=$shared/patches.list
 nb_patches=(); wg_patches=()
 while read -r patch; do nb_patches+=("$pdir/$patch"); done < <(pick "$list" exit netbird)
 while read -r patch; do wg_patches+=("$pdir/$patch"); done < <(pick "$list" exit wireguard)
