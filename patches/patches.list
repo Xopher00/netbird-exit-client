@@ -3,11 +3,11 @@
 # (exit-server/scripts/build.sh, copied to the public repo by publish.sh).
 # A line with "wireguard" applies to the wireguard-go checkout instead of NetBird.
 
-# gRPC to Management and Signal: with NB_GRPC_WEBSOCKET=true it rides the self-hosted server's WebSocket wrapper, for hosts behind a proxy that does not pass gRPC; and the reconnect wait is capped at 30 s, down from 120 s, so a client reaches a server soon after it wakes; and NetBird's own repair of desynced Rosenpass keys starts at the first WireGuard handshake timeout, not the third.
+# gRPC to Management and Signal: with NB_GRPC_WEBSOCKET=true it rides the self-hosted server's WebSocket wrapper, for hosts behind a proxy that does not pass gRPC; and the reconnect wait is capped at 30 s, down from 120 s, so a client reaches a server soon after it wakes.
 netbird-grpc-websocket.patch phone exit
 # Padding, NetBird's half: each peer update switches on Maybenot padding when NB_DAITA_MACHINES holds machines, and full-size packets when NB_DAITA_FULL_SIZE=true. The machinery is wireguard-padding.patch.
 netbird-padding.patch phone exit
-# Connections to the host in NB_ECH_HOST use ECH after a DNS-over-HTTPS lookup, or are refused; QUIC to it is skipped.
+# Connections to the host in NB_ECH_HOST use ECH after a DNS-over-HTTPS lookup, or are refused; the app sets NB_RELAY_TRANSPORT=ws so the relay never uses QUIC.
 netbird-ech.patch phone exit
 # The answer goes out before ICE candidates, and each new ICE agent gets the remote candidates of the last 5 s, so a direct link can form in the first round instead of after minutes on the relay. Drop this once netbirdio/netbird#8443 is fixed upstream.
 netbird-ice-first-round.patch phone exit

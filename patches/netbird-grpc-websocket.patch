@@ -131,16 +131,3 @@ index 72b3538b..bb47f93e 100644
  }
  
  func dialContext(ctx context.Context, addr string) (net.Conn, error) {
-diff --git a/client/internal/peer/conn.go b/client/internal/peer/conn.go
-index b3d3a95a..26e6be19 100644
---- a/client/internal/peer/conn.go
-+++ b/client/internal/peer/conn.go
-@@ -34,7 +34,7 @@ import (
- // wgTimeoutEscalationThreshold is the number of consecutive WireGuard
- // handshake timeouts after which the rosenpass state for the peer is
- // considered desynced and gets reset.
--const wgTimeoutEscalationThreshold = 3
-+const wgTimeoutEscalationThreshold = 1
- 
- // MetricsRecorder is an interface for recording peer connection metrics
- type MetricsRecorder interface {

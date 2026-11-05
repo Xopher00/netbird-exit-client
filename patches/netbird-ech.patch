@@ -40,29 +40,6 @@ index 00071461..f8b72c25 100644
  			return
  		}
  
-diff --git a/shared/relay/client/dialer/quic/quic.go b/shared/relay/client/dialer/quic/quic.go
-index cbf6ea30..201b37dd 100644
---- a/shared/relay/client/dialer/quic/quic.go
-+++ b/shared/relay/client/dialer/quic/quic.go
-@@ -4,6 +4,7 @@ import (
- 	"context"
- 	"errors"
- 	"fmt"
-+	"github.com/netbirdio/netbird/client/net/ech"
- 	"net"
- 	"strings"
- 	"time"
-@@ -34,6 +35,10 @@ func (d Dialer) Dial(ctx context.Context, address, serverName string) (net.Conn,
- 	if err != nil {
- 		return nil, err
- 	}
-+	// QUIC's Initial packets show the server name to any observer, and its address lookup is plain DNS.
-+	if host, _, splitErr := net.SplitHostPort(quicURL); splitErr == nil && (ech.On(host) || ech.On(serverName)) {
-+		return nil, fmt.Errorf("quic to %s skipped: the host requires ECH", host)
-+	}
- 
- 	// Get the base TLS config
- 	tlsClientConfig := quictls.ClientQUICTLSConfig()
 diff --git a/shared/relay/client/dialer/ws/ws.go b/shared/relay/client/dialer/ws/ws.go
 index 6b310b73..ecadacb0 100644
 --- a/shared/relay/client/dialer/ws/ws.go
@@ -75,12 +52,18 @@ index 6b310b73..ecadacb0 100644
  	"github.com/netbirdio/netbird/shared/relay"
  	"github.com/netbirdio/netbird/util/embeddedroots"
  )
-@@ -104,6 +105,10 @@ func httpClientNbDialer(serverName string, underlyingOut *net.Conn) *http.Client
+@@ -104,6 +105,16 @@ func httpClientNbDialer(serverName string, underlyingOut *net.Conn) *http.Client
  		},
  	}
  
-+	if ech.On(serverName) {
-+		customTransport.DialTLSContext = ech.TLSDialer(customTransport.DialContext, serverName, &tls.Config{RootCAs: certPool, NextProtos: []string{"http/1.1"}})
++	// The name path passes no serverName, so the dialer decides from the host, as the gRPC WebSocket's does.
++	tlsDial := ech.TLSDialer(customDialer.DialContext, serverName, &tls.Config{RootCAs: certPool, NextProtos: []string{"http/1.1"}})
++	customTransport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++		c, err := tlsDial(ctx, network, addr)
++		if err == nil && underlyingOut != nil {
++			*underlyingOut = c
++		}
++		return c, err
 +	}
 +
  	return &http.Client{

@@ -234,7 +234,8 @@ func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
 	return e, nil
 }
 
-// query asks each resolver in turn (RFC 8484, POST) and returns the answer records and their smallest TTL.
+// query asks every resolver at once (RFC 8484, POST), because a network can block one of them and waiting it out would
+// cost the client's whole timeout. It returns the first good answer's records and their smallest TTL.
 func query(ctx context.Context, client *http.Client, host string, qtype uint16) ([]dns.RR, uint32, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(host), qtype)
@@ -243,38 +244,57 @@ func query(ctx context.Context, client *http.Client, host string, qtype uint16) 
 	if err != nil {
 		return nil, 0, err
 	}
-	var last error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type answer struct {
+		rrs []dns.RR
+		ttl uint32
+		err error
+	}
+	answers := make(chan answer, len(resolvers))
 	for _, url := range resolvers {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
-		if err != nil {
-			return nil, 0, err
+		go func() {
+			rrs, ttl, err := ask(ctx, client, url, wire, host)
+			answers <- answer{rrs, ttl, err}
+		}()
+	}
+	var last error
+	for range resolvers {
+		a := <-answers
+		if a.err == nil {
+			return a.rrs, a.ttl, nil
 		}
-		req.Header.Set("Content-Type", "application/dns-message")
-		req.Header.Set("Accept", "application/dns-message")
-		resp, err := client.Do(req)
-		if err != nil {
-			last = err
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			last = fmt.Errorf("doh %s: status %d %v", url, resp.StatusCode, err)
-			continue
-		}
-		var r dns.Msg
-		if err := r.Unpack(body); err != nil {
-			last = err
-			continue
-		}
-		if r.Rcode != dns.RcodeSuccess {
-			return nil, 0, fmt.Errorf("doh %s: %s for %s", url, dns.RcodeToString[r.Rcode], host)
-		}
-		ttl := uint32(3600)
-		for _, rr := range r.Answer {
-			ttl = min(ttl, rr.Header().Ttl)
-		}
-		return r.Answer, ttl, nil
+		last = a.err
 	}
 	return nil, 0, fmt.Errorf("dns over https for %s: %w", host, last)
+}
+
+func ask(ctx context.Context, client *http.Client, url string, wire []byte, host string) ([]dns.RR, uint32, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wire))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("doh %s: status %d %v", url, resp.StatusCode, err)
+	}
+	var r dns.Msg
+	if err := r.Unpack(body); err != nil {
+		return nil, 0, err
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		return nil, 0, fmt.Errorf("doh %s: %s for %s", url, dns.RcodeToString[r.Rcode], host)
+	}
+	ttl := uint32(3600)
+	for _, rr := range r.Answer {
+		ttl = min(ttl, rr.Header().Ttl)
+	}
+	return r.Answer, ttl, nil
 }
