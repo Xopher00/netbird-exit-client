@@ -21,6 +21,10 @@ import (
 
 // echConfig builds one ECHConfig (draft-ietf-tls-esni-18): DHKEM(X25519), HKDF-SHA256, AES-128-GCM.
 func echConfig(t *testing.T) (config, list, private []byte) {
+	return echConfigFor(t, "public.example")
+}
+
+func echConfigFor(t *testing.T, name string) (config, list, private []byte) {
 	key, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +37,6 @@ func echConfig(t *testing.T) (config, list, private []byte) {
 	c = append(c, pub...)
 	c = append(c, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01) // one suite: HKDF-SHA256, AES-128-GCM
 	c = append(c, 0)                                  // maximum_name_length
-	name := "public.example"
 	c = append(c, byte(len(name)))
 	c = append(c, name...)
 	c = append(c, 0x00, 0x00) // extensions
@@ -118,6 +121,52 @@ func TestAcceptedECHConnects(t *testing.T) {
 	defer c.Close()
 	if !c.(*tls.Conn).ConnectionState().ECHAccepted {
 		t.Fatal("ECH not accepted")
+	}
+}
+
+// A retry after a key change, dialled at a literal address, goes to that address with the new key and leaves the
+// name's cached addresses and key as DNS published them.
+func TestARetryAtALiteralAddressLeavesTheCacheAlone(t *testing.T) {
+	_, oldList, _ := echConfigFor(t, "example.com")
+	newConfig, _, newPriv := echConfigFor(t, "example.com")
+	fakeDoH(t, oldList)
+	l, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skip("no 127.0.0.2 on this machine:", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Listener.Close()
+	srv.Listener = l
+	var conns atomic.Int32
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.TLS = &tls.Config{EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{{Config: newConfig, PrivateKey: newPriv, SendAsRetry: true}}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d := &net.Dialer{}
+	c, err := DialTLS(ctx, d.DialContext, l.Addr().String(), "example.com", &tls.Config{RootCAs: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if n := conns.Load(); n != 2 {
+		t.Fatalf("the literal address got %d connections, want 2 (the rejected one and the retry)", n)
+	}
+	mu.Lock()
+	e := cache["example.com"]
+	mu.Unlock()
+	if len(e.ips) != 1 || e.ips[0] != "127.0.0.1" {
+		t.Fatalf("cached addresses %v, want the DNS answer [127.0.0.1]", e.ips)
+	}
+	if string(e.ech) != string(oldList) {
+		t.Fatal("a literal address's retry key replaced the name's published key")
 	}
 }
 

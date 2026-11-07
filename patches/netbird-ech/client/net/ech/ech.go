@@ -1,5 +1,5 @@
-// Package ech connects to one host with Encrypted Client Hello, looking the host up over DNS over HTTPS, so its
-// name appears neither in DNS nor in the TLS handshake. Hopper sets NB_ECH_HOST to its own server's host.
+// Package ech connects to Hopper's own hosts (NB_ECH_HOST, comma-separated) with Encrypted Client Hello after a DNS over
+// HTTPS lookup, so the name is in neither DNS nor the TLS handshake. Other hosts use DialDoH.
 package ech
 
 import (
@@ -45,8 +45,14 @@ var (
 
 // On reports whether connections to host must use ECH.
 func On(host string) bool {
-	want := strings.TrimSuffix(os.Getenv(EnvHost), ".")
-	return want != "" && strings.EqualFold(want, strings.TrimSuffix(host, "."))
+	host = strings.TrimSuffix(host, ".")
+	for _, want := range strings.Split(os.Getenv(EnvHost), ",") {
+		want = strings.TrimSuffix(strings.TrimSpace(want), ".")
+		if want != "" && strings.EqualFold(want, host) {
+			return true
+		}
+	}
+	return false
 }
 
 func roots() *x509.CertPool {
@@ -71,21 +77,55 @@ func TLSDialer(dial DialFunc, name string, base *tls.Config) func(ctx context.Co
 		if On(server) || On(host) {
 			return DialTLS(ctx, dial, addr, server, base)
 		}
-		raw, err := dial(ctx, "tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		cfg := base.Clone()
-		if cfg.ServerName == "" {
-			cfg.ServerName = server
-		}
-		c := tls.Client(raw, cfg)
-		if err := c.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
-			return nil, err
-		}
-		return c, nil
+		return DialDoH(ctx, dial, addr, server, base)
 	}
+}
+
+// DialDoH connects with ordinary TLS to an address from DNS over HTTPS. Only when every lookup fails does the dialer
+// resolve the name itself, so an ECH host must use DialTLS, which never falls back.
+func DialDoH(ctx context.Context, dial DialFunc, addr, name string, base *tls.Config) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if name == "" {
+		name = host
+	}
+	var raw net.Conn
+	if net.ParseIP(host) != nil {
+		raw, err = dial(ctx, "tcp", addr)
+	} else if raw, err = dialAny(ctx, dial, host, port); err != nil {
+		raw, err = dial(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	cfg := base.Clone()
+	if cfg.ServerName == "" {
+		cfg.ServerName = name
+	}
+	c := tls.Client(raw, cfg)
+	if err := c.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+func dialAny(ctx context.Context, dial DialFunc, host, port string) (net.Conn, error) {
+	ips, err := addresses(ctx, dial, host)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	for _, ip := range ips {
+		raw, err := dial(ctx, "tcp", net.JoinHostPort(ip, port))
+		if err == nil {
+			return raw, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 // DialTLS connects to addr with ECH for name, at an address from DNS over HTTPS unless addr already holds one.
@@ -102,16 +142,23 @@ func DialTLS(ctx context.Context, dial DialFunc, addr, name string, base *tls.Co
 	if err != nil {
 		return nil, err
 	}
-	if net.ParseIP(host) != nil {
-		e.ips = []string{host}
+	// A literal address is for this dial only: the cache keeps the name's DNS addresses, and a key that front sends
+	// back is not cached for the name either, since it may not be the front DNS names.
+	literal := net.ParseIP(host) != nil
+	at := e
+	if literal {
+		at.ips = []string{host}
 	}
-	conn, err := handshake(ctx, dial, name, port, e, base)
+	conn, err := handshake(ctx, dial, name, port, at, base)
 	// A server whose key changed answers with the new one; one retry with it.
 	var rejected *tls.ECHRejectionError
 	if errors.As(err, &rejected) && len(rejected.RetryConfigList) > 0 {
-		e.ech = rejected.RetryConfigList
-		store(name, e)
-		conn, err = handshake(ctx, dial, name, port, e, base)
+		at.ech = rejected.RetryConfigList
+		if !literal {
+			e.ech = at.ech
+			store(name, e)
+		}
+		conn, err = handshake(ctx, dial, name, port, at, base)
 	}
 	return conn, err
 }
@@ -159,13 +206,13 @@ func store(host string, e entry) {
 	mu.Unlock()
 }
 
-func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
-	mu.Lock()
-	e, ok := cache[host]
-	mu.Unlock()
-	if ok && time.Now().Before(e.until) {
-		return e, nil
-	}
+type result struct {
+	rrs []dns.RR
+	ttl uint32
+	err error
+}
+
+func askAll(ctx context.Context, dial DialFunc, host string, types []uint16) []result {
 	pool := dohRoots
 	if pool == nil {
 		pool = roots()
@@ -176,12 +223,6 @@ func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
 		// This transport lasts one lookup, so an idle connection would stay open with nothing to reuse it.
 		DisableKeepAlives: true,
 	}}
-	type result struct {
-		rrs []dns.RR
-		ttl uint32
-		err error
-	}
-	types := []uint16{dns.TypeHTTPS, dns.TypeA, dns.TypeAAAA}
 	results := make([]result, len(types))
 	var wg sync.WaitGroup
 	for i, t := range types {
@@ -193,6 +234,55 @@ func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
 		}()
 	}
 	wg.Wait()
+	return results
+}
+
+// addresses gives host's A and AAAA records over DNS over HTTPS, cached by TTL under a key that cannot meet lookup's.
+func addresses(ctx context.Context, dial DialFunc, host string) ([]string, error) {
+	key := "doh:" + host
+	mu.Lock()
+	e, ok := cache[key]
+	mu.Unlock()
+	if ok && time.Now().Before(e.until) {
+		return e.ips, nil
+	}
+	var v4, v6 []string
+	ttl := uint32(3600)
+	var last error
+	for _, r := range askAll(ctx, dial, host, []uint16{dns.TypeA, dns.TypeAAAA}) {
+		if r.err != nil {
+			last = r.err
+			continue
+		}
+		ttl = min(ttl, r.ttl)
+		for _, rr := range r.rrs {
+			switch a := rr.(type) {
+			case *dns.A:
+				v4 = append(v4, a.A.String())
+			case *dns.AAAA:
+				v6 = append(v6, a.AAAA.String())
+			}
+		}
+	}
+	ips := append(v4, v6...)
+	if len(ips) == 0 {
+		if last == nil {
+			last = fmt.Errorf("%s has no address in DNS", host)
+		}
+		return nil, last
+	}
+	store(key, entry{ips: ips, until: time.Now().Add(time.Duration(max(ttl, 60)) * time.Second)})
+	return ips, nil
+}
+
+func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
+	mu.Lock()
+	e, ok := cache[host]
+	mu.Unlock()
+	if ok && time.Now().Before(e.until) {
+		return e, nil
+	}
+	results := askAll(ctx, dial, host, []uint16{dns.TypeHTTPS, dns.TypeA, dns.TypeAAAA})
 	if results[0].err != nil {
 		return entry{}, results[0].err
 	}
