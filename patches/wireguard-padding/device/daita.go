@@ -523,6 +523,7 @@ func (daita *MaybenotDaita) hold(elems ...*QueueOutboundElement) bool {
 // holdPadding takes a built padding packet into the hold queue while a block holds it, and reports
 // whether it was held (false: the hold is full, the padding leaves at once like the fail-open path).
 func (daita *MaybenotDaita) holdPadding(elem *QueueOutboundElement, machine uint64) bool {
+	elem.daitaMachine = machine
 	return daita.hold(elem)
 }
 
@@ -545,27 +546,36 @@ func (daita *MaybenotDaita) releaseHeld(peer *Peer) {
 			}
 			continue
 		}
-		container, ok := peer.device.TryGetOutboundElementsContainer()
-		if !ok {
-			// fail-open: no container from the pool, the held packets leave one by one
-			for _, elem := range batch {
-				if one, ok1 := peer.device.TryGetOutboundElementsContainer(); ok1 {
-					one.elems = append(one.elems, elem)
-					peer.StagePackets(one)
-				}
-			}
-			continue
-		}
-		container.elems = append(container.elems, batch...)
-		peer.StagePackets(container)
-		peer.SendStagedPackets()
-		for _, elem := range batch {
+		// Reported before a packet is staged: any sender may then take it and return it to the pool, which reuses it.
+		report := func(elem *QueueOutboundElement) {
 			if elem.daitaPadding {
 				daita.PaddingSent(peer, elem.daitaMachine)
 			} else {
 				daita.NormalSent(peer)
 			}
 		}
+		if container, ok := peer.device.TryGetOutboundElementsContainer(); ok {
+			for _, elem := range batch {
+				report(elem)
+			}
+			container.elems = append(container.elems, batch...)
+			peer.StagePackets(container)
+		} else {
+			// fail-open: no container from the pool, so the held packets leave one by one; one that gets none
+			// returns its buffer and is not reported
+			for _, elem := range batch {
+				one, ok := peer.device.TryGetOutboundElementsContainer()
+				if !ok {
+					peer.device.PutMessageBuffer(elem.buffer)
+					peer.device.PutOutboundElement(elem)
+					continue
+				}
+				report(elem)
+				one.elems = append(one.elems, elem)
+				peer.StagePackets(one)
+			}
+		}
+		peer.SendStagedPackets()
 	}
 }
 
