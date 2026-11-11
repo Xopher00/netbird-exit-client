@@ -9,7 +9,7 @@ netbird-grpc-websocket.patch phone exit
 netbird-padding.patch phone exit
 # Connections to the hosts in NB_ECH_HOST use ECH after a DNS-over-HTTPS lookup, or are refused; any other host resolves over DNS over HTTPS, with the network's DNS as the fallback. The app sets NB_RELAY_TRANSPORT=ws so the relay never uses QUIC.
 netbird-ech.patch phone exit
-# The answer goes out before ICE candidates, and each new ICE agent gets the remote candidates of the last 5 s, so a direct link can form in the first round instead of after minutes on the relay. Drop this once netbirdio/netbird#8443 is fixed upstream.
+# The answer goes out before ICE candidates, and each new ICE agent gets the remote candidates of the last 5 s, so a direct link can form in the first round instead of after minutes on the relay. Drop this once upstream fixes it (netbirdio/netbird discussion 8443; still unfixed in v0.82.1).
 netbird-ice-first-round.patch phone exit
 # Padding, wireguard-go's half: Mullvad's DAITA ported to the batched send path, with the Maybenot BlockOutgoing action; built with Rust maybenot-ffi for arm64.
 wireguard-padding.patch wireguard phone exit
