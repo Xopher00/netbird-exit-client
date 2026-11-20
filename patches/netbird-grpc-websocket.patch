@@ -1,5 +1,5 @@
 diff --git a/client/grpc/dialer.go b/client/grpc/dialer.go
-index 9a6bc067..69b37a9f 100644
+index 9a6bc067..37a19d2c 100644
 --- a/client/grpc/dialer.go
 +++ b/client/grpc/dialer.go
 @@ -5,19 +5,33 @@ import (
@@ -97,7 +97,7 @@ index 9a6bc067..69b37a9f 100644
 +	}
 +}
 +
-+// sweptDialer registers dial's connections and dials with the sweeper, as WithSweeper does for the TCP dialer.
++// sweptDialer registers dial's connections and dials with the sweeper, for the TCP dialer and the WebSocket one.
 +func sweptDialer(sweeper Sweeper, dial func(context.Context, string) (net.Conn, error)) func(context.Context, string) (net.Conn, error) {
 +	return func(ctx context.Context, addr string) (net.Conn, error) {
 +		d := sweeper.StartDial(ctx)
@@ -110,24 +110,24 @@ index 9a6bc067..69b37a9f 100644
 +	}
 +}
 diff --git a/client/grpc/dialer_generic.go b/client/grpc/dialer_generic.go
-index 72b3538b..bb47f93e 100644
+index 72b3538b..b5e5599f 100644
 --- a/client/grpc/dialer_generic.go
 +++ b/client/grpc/dialer_generic.go
-@@ -29,7 +29,7 @@ func WithCustomDialer(_ bool, _ string) grpc.DialOption {
+@@ -29,16 +29,7 @@ func WithCustomDialer(_ bool, _ string) grpc.DialOption {
  // dials with the sweeper. Append it after WithCustomDialer: gRPC applies
  // dial options in order, so the later context dialer wins.
  func WithSweeper(sweeper Sweeper) grpc.DialOption {
 -	return grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-+	return sweeperOption{sweeper: sweeper, DialOption: grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
- 		dial := sweeper.StartDial(ctx)
- 		defer dial.Release()
- 
-@@ -38,7 +38,7 @@ func WithSweeper(sweeper Sweeper) grpc.DialOption {
- 			return nil, err
- 		}
- 		return dial.WrapConn(conn)
+-		dial := sweeper.StartDial(ctx)
+-		defer dial.Release()
+-
+-		conn, err := dialContext(dial.Ctx(), addr)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return dial.WrapConn(conn)
 -	})
-+	})}
++	return sweeperOption{sweeper: sweeper, DialOption: grpc.WithContextDialer(sweptDialer(sweeper, dialContext))}
  }
  
  func dialContext(ctx context.Context, addr string) (net.Conn, error) {

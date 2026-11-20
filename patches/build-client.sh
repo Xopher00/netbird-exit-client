@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The exit servers' NetBird client: v0.82.0 plus the WebSocket patch and the 30 s reconnect cap (stock gRPC cannot pass Cloudflare; netbird-grpc-websocket.patch) and
-# Maybenot padding (off unless NB_DAITA_MACHINES or NB_DAITA_FULL_SIZE is set; Hopper's app/CLAUDE.md), and ECH to the
+# Maybenot padding (off unless NB_DAITA=server; Hopper's app/engine/DESIGN.md), and ECH to the
 # host in NB_ECH_HOST, and the ICE first-round fix (netbird-ice-first-round.patch).
 # Output: build/netbird-0.82.0-hopper.gz and build/SHA256SUMS, for publish.sh.
 set -euo pipefail
@@ -25,11 +25,10 @@ wt=$build/exit-client-src
 wgwt=$build/wireguard-go-src
 
 list=$shared/patches.list
-git -C "$NB_SRC" rev-parse -q --verify "refs/tags/$NB_VERSION" >/dev/null || { echo "$NB_SRC has no tag $NB_VERSION" >&2; exit 1; }
+ensure_rev "$NB_SRC" https://github.com/netbirdio/netbird.git "refs/tags/$NB_VERSION" || exit 1
 # Padding goes onto the netbirdio/wireguard-go commit this NetBird release pins.
 WG_COMMIT=$(wg_commit "$NB_SRC" "$NB_VERSION")
-[ -d "$WG_SRC" ] || git clone -q https://github.com/netbirdio/wireguard-go.git "$WG_SRC"
-git -C "$WG_SRC" rev-parse -q --verify "$WG_COMMIT^{commit}" >/dev/null || { echo "$WG_SRC has no commit $WG_COMMIT" >&2; exit 1; }
+ensure_rev "$WG_SRC" https://github.com/netbirdio/wireguard-go.git "$WG_COMMIT" || exit 1
 
 cleanup() {
   worktree_drop "$NB_SRC" "$wt"

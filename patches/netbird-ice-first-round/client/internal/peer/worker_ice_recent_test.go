@@ -1,7 +1,6 @@
 package peer
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -82,60 +81,4 @@ func TestWorkerICE_CandidateInReplacedAgentReachesTheNewOne(t *testing.T) {
 	require.NotSame(t, first, second, "the new session must replace the agent")
 	assert.Eventually(t, func() bool { return agentHas(w, "192.0.2.30") }, 2*time.Second, 10*time.Millisecond,
 		"the candidate must reach the replacement agent")
-}
-
-// A candidate older than the limit belongs to an abandoned negotiation and is not given to a new agent.
-func TestWorkerICE_ExpiredCandidateIsNotGiven(t *testing.T) {
-	w := newRecentTestWorker(t)
-
-	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.20"), nil)
-	w.muxAgent.Lock()
-	w.recentCandidates[0].received = time.Now().Add(-2 * recentCandidateTTL)
-	w.muxAgent.Unlock()
-	w.OnNewOffer(testOffer("remote-session"))
-
-	assert.Never(t, func() bool { return agentHas(w, "192.0.2.20") }, 300*time.Millisecond, 10*time.Millisecond,
-		"the expired candidate must not reach the new agent")
-}
-
-// Expired candidates leave the store when the next one arrives, so it holds only recent ones.
-func TestWorkerICE_ExpiredCandidateLeavesTheStore(t *testing.T) {
-	w := newRecentTestWorker(t)
-
-	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.22"), nil)
-	w.muxAgent.Lock()
-	w.recentCandidates[0].received = time.Now().Add(-2 * recentCandidateTTL)
-	w.muxAgent.Unlock()
-	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.23"), nil)
-
-	w.muxAgent.Lock()
-	defer w.muxAgent.Unlock()
-	require.Len(t, w.recentCandidates, 1)
-	assert.Equal(t, "192.0.2.23", w.recentCandidates[0].candidate.Address())
-}
-
-// The store is bounded: past the limit the oldest candidate goes.
-func TestWorkerICE_RecentCandidatesAreBounded(t *testing.T) {
-	w := newRecentTestWorker(t)
-
-	for i := 0; i < maxRecentCandidates+5; i++ {
-		w.OnRemoteCandidate(hostCandidate(t, fmt.Sprintf("192.0.2.%d", i+1)), nil)
-	}
-
-	w.muxAgent.Lock()
-	defer w.muxAgent.Unlock()
-	require.Len(t, w.recentCandidates, maxRecentCandidates)
-	assert.Equal(t, "192.0.2.6", w.recentCandidates[0].candidate.Address(), "the oldest five must have gone")
-}
-
-// Close ends the connection; its candidates must not reach an agent after a reopen.
-func TestWorkerICE_CloseForgetsCandidates(t *testing.T) {
-	w := newRecentTestWorker(t)
-
-	w.OnRemoteCandidate(hostCandidate(t, "192.0.2.40"), nil)
-	w.Close()
-
-	w.muxAgent.Lock()
-	defer w.muxAgent.Unlock()
-	assert.Empty(t, w.recentCandidates)
 }

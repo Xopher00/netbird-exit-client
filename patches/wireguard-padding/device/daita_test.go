@@ -5,29 +5,10 @@ package device
 import (
 	"encoding/binary"
 	"net/netip"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// MACHINES names a directory of <name>.txt machine files (Hopper's app/src/main/assets/padding).
-func machinesFor(t *testing.T, name string) string {
-	if b, err := os.ReadFile(filepath.Join("testdata", name+".txt")); err == nil {
-		return strings.TrimSpace(string(b))
-	}
-	dir := os.Getenv("MACHINES")
-	if dir == "" {
-		t.Skip("MACHINES not set")
-	}
-	b, err := os.ReadFile(filepath.Join(dir, name+".txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.TrimSpace(string(b))
-}
 
 func udpPacket(src, dst netip.Addr, payload int) []byte {
 	p := make([]byte, 20+8+payload)
@@ -51,7 +32,7 @@ func udpPacket(src, dst netip.Addr, payload int) []byte {
 type wire struct{ cliTx, srvTx, delivered, sent uint64 }
 
 // Three page loads: a small request, a burst of full-size packets back, then idle.
-func pageLoads(t *testing.T, setup func(cli, srv *Peer)) wire {
+func pageLoads(t *testing.T, setup func(cli, srv *Peer)) (wire, *Peer, *Peer) {
 	pair := genTestPair(t, true)
 	peerOf := func(i int) *Peer {
 		for _, p := range pair[i].dev.peers.keyMap {
@@ -93,60 +74,80 @@ func pageLoads(t *testing.T, setup func(cli, srv *Peer)) wire {
 		time.Sleep(time.Second)
 	}
 	time.Sleep(2 * time.Second)
-	return wire{cli.txBytes.Load(), srv.txBytes.Load(), got.Load(), sent}
+	return wire{cli.txBytes.Load(), srv.txBytes.Load(), got.Load(), sent}, cli, srv
 }
 
-func enable(t *testing.T, p *Peer, machines string) {
-	if !p.EnableDaita(machines, 1024, 1.0, 1.0) {
-		t.Fatal("EnableDaita failed")
+func enable(t *testing.T, p *Peer, role string) {
+	if !p.EnablePadding(role) {
+		t.Fatal("EnablePadding failed")
 	}
-	if !p.DaitaEnabled() || p.EnableDaita(machines, 1024, 1.0, 1.0) {
-		t.Fatal("a second EnableDaita must be refused")
+	if !p.DaitaEnabled() || p.EnablePadding(role) {
+		t.Fatal("a second EnablePadding must be refused")
 	}
 }
 
 func TestDaitaPadding(t *testing.T) {
-	base := pageLoads(t, func(cli, srv *Peer) {})
-	for _, family := range []string{"break_pad", "interspace"} {
-		cm, sm := machinesFor(t, family+"_client"), machinesFor(t, family+"_server")
-		w := pageLoads(t, func(cli, srv *Peer) { enable(t, cli, cm); enable(t, srv, sm) })
-		t.Logf("%-10s client->server %7d B (base %d)  server->client %8d B (base %d)  delivered %d of %d B",
-			family, w.cliTx, base.cliTx, w.srvTx, base.srvTx, w.delivered, w.sent)
-		if w.delivered != w.sent {
-			t.Errorf("%s: delivered %d B, want %d", family, w.delivered, w.sent)
+	base, _, _ := pageLoads(t, func(cli, srv *Peer) {})
+	w, cli, srv := pageLoads(t, func(cli, srv *Peer) { enable(t, cli, "client"); enable(t, srv, "server") })
+	t.Logf("client->server %7d B (base %d)  server->client %8d B (base %d)  delivered %d of %d B",
+		w.cliTx, base.cliTx, w.srvTx, base.srvTx, w.delivered, w.sent)
+	if w.delivered != w.sent {
+		t.Errorf("delivered %d B, want %d", w.delivered, w.sent)
+	}
+	if w.cliTx+w.srvTx <= base.cliTx+base.srvTx {
+		t.Error("no padding on the wire")
+	}
+	// What one end counts as dummies sent, the other counts as dummies received, give or take packets in flight.
+	cli.Stop()
+	srv.Stop()
+	cliTx, cliRx := cli.PaddingBytes()
+	srvTx, srvRx := srv.PaddingBytes()
+	if cliTx+srvTx == 0 {
+		t.Error("no dummy bytes counted")
+	}
+	for _, d := range []struct{ sent, got uint64 }{{cliTx, srvRx}, {srvTx, cliRx}} {
+		if diff := int64(d.sent) - int64(d.got); diff < 0 || diff > 4*1500 {
+			t.Errorf("dummy bytes sent %d, received %d", d.sent, d.got)
 		}
-		if w.cliTx+w.srvTx <= base.cliTx+base.srvTx {
-			t.Errorf("%s: no padding on the wire", family)
+	}
+}
+
+// The idle turn-off reads bytes minus dummy bytes; that must be the same traffic as with padding off.
+func TestDaitaRealBytes(t *testing.T) {
+	stopped := func(p *Peer) (tx, padTx uint64) {
+		p.Stop()
+		padTx, _ = p.PaddingBytes()
+		return p.txBytes.Load(), padTx
+	}
+	_, offCli, offSrv := pageLoads(t, func(cli, srv *Peer) {})
+	offCliTx, _ := stopped(offCli)
+	offSrvTx, _ := stopped(offSrv)
+	_, cli, srv := pageLoads(t, func(cli, srv *Peer) { enable(t, cli, "client"); enable(t, srv, "server") })
+	cliTx, cliPad := stopped(cli)
+	srvTx, srvPad := stopped(srv)
+	for _, c := range []struct {
+		name            string
+		wire, pad, base uint64
+	}{{"client", cliTx, cliPad, offCliTx}, {"server", srvTx, srvPad, offSrvTx}} {
+		real, slack := int64(c.wire-c.pad), max(int64(c.base)/50, 256) // 2%, or a few keepalives on the small side
+		if d := real - int64(c.base); d < -slack || d > slack {
+			t.Errorf("%s: real bytes %d with padding, %d without (dummy bytes %d)", c.name, real, c.base, c.pad)
 		}
 	}
 }
 
 // A peer without DAITA drops padding as an unknown IP version and keeps every real packet.
 func TestDaitaOneSided(t *testing.T) {
-	sm := machinesFor(t, "interspace_server")
-	w := pageLoads(t, func(cli, srv *Peer) { enable(t, srv, sm) })
+	w, _, _ := pageLoads(t, func(cli, srv *Peer) { enable(t, srv, "server") })
 	if w.delivered != w.sent {
 		t.Errorf("delivered %d B, want %d", w.delivered, w.sent)
-	}
-}
-
-func TestConstantPacketSize(t *testing.T) {
-	base := pageLoads(t, func(cli, srv *Peer) {})
-	w := pageLoads(t, func(cli, srv *Peer) { cli.SetConstantPacketSize(true); srv.SetConstantPacketSize(true) })
-	t.Logf("client->server %d B (base %d)", w.cliTx, base.cliTx)
-	if w.delivered != w.sent {
-		t.Errorf("delivered %d B, want %d", w.delivered, w.sent)
-	}
-	if w.cliTx < 2*base.cliTx {
-		t.Errorf("small packets were not padded: %d B against %d B", w.cliTx, base.cliTx)
 	}
 }
 
 func TestDaitaStopsWithPeer(t *testing.T) {
-	cm := machinesFor(t, "interspace_client")
 	pair := genTestPair(t, true)
 	for _, p := range pair[0].dev.peers.keyMap {
-		enable(t, p, cm)
+		enable(t, p, "client")
 		done := make(chan struct{})
 		go func() { p.Stop(); close(done) }()
 		select {
@@ -160,64 +161,38 @@ func TestDaitaStopsWithPeer(t *testing.T) {
 	}
 }
 
-// A Maybenot block holds outgoing real traffic and releases it at the block's end: every packet must
-// still reach the application (blocking delays, never drops), and the release counts as the packets'
-// send so the machines see them. The test machine blocks 200 ms on each NormalSent, one-sided.
-func TestDaitaBlocking(t *testing.T) {
-	cm := machinesFor(t, "block_test_client")
-	base := pageLoads(t, func(cli, srv *Peer) {})
-	w := pageLoads(t, func(cli, srv *Peer) { enable(t, cli, cm) })
-	if w.delivered != w.sent {
-		t.Errorf("blocking lost packets: delivered %d of sent %d", w.delivered, w.sent)
+func TestDefenseIndex(t *testing.T) {
+	var a, b, c NoisePublicKey
+	a[0], b[0], c[0] = 1, 2, 3
+	if defenseIndex(a, b, 500) != defenseIndex(b, a, 500) {
+		t.Error("the two ends of one tunnel pick different defenses")
 	}
-	if w.cliTx+w.srvTx < base.cliTx+base.srvTx {
-		t.Errorf("blocked traffic lost bytes on the wire: %d against %d", w.cliTx+w.srvTx, base.cliTx+base.srvTx)
+	picks := map[int]bool{}
+	for i := range 50 {
+		c[1] = byte(i)
+		picks[defenseIndex(a, c, 500)] = true
 	}
-}
-
-// Peer.Stop must not hang with a block active, and held packets must not leak: their buffers return
-// to the pools.
-func TestDaitaStopsWithBlockActive(t *testing.T) {
-	cm := machinesFor(t, "block_test_client")
-	pair := genTestPair(t, true)
-	for _, p := range pair[0].dev.peers.keyMap {
-		enable(t, p, cm)
-		pair[0].tun.Outbound <- udpPacket(pair[0].ip, pair[1].ip, 300)
-		time.Sleep(50 * time.Millisecond) // the block fires and holds the packet
-		if d := p.getDaita(); d == nil || !d.(*MaybenotDaita).isBlocked() {
-			t.Skip("the block did not fire; the stop assert would test nothing")
-		}
-		done := make(chan struct{})
-		go func() { p.Stop(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Peer.Stop hung with a block active")
-		}
-		if p.DaitaEnabled() {
-			t.Fatal("DAITA still on after Stop")
-		}
+	if len(picks) < 40 {
+		t.Errorf("50 keys picked only %d defenses", len(picks))
 	}
 }
 
-// A full-size keepalive would read as data at the receiver, which answers it: the tunnel would never go quiet.
-func TestConstantPacketSizeKeepsKeepalivesSmall(t *testing.T) {
-	pair := genTestPair(t, true)
-	for i := range pair {
-		for _, p := range pair[i].dev.peers.keyMap {
-			p.SetConstantPacketSize(true)
+func TestDummySize(t *testing.T) {
+	var d MaybenotDaita
+	if got := d.dummySize(1280); got != int(DaitaHeaderLen) {
+		t.Errorf("before any real packet: %d, want %d", got, DaitaHeaderLen)
+	}
+	d.RecordSize(52)
+	d.RecordSize(1280)
+	for range 100 {
+		if got := d.dummySize(1280); got != 52 && got != 1280 {
+			t.Fatalf("dummy size %d is no size the peer sent", got)
 		}
 	}
-	pair.Send(t, Ping, nil)
-	time.Sleep(KeepaliveTimeout + 3*time.Second)
-	var before uint64
-	for _, p := range pair[0].dev.peers.keyMap {
-		before = p.txBytes.Load() + p.rxBytes.Load()
-	}
-	time.Sleep(2*KeepaliveTimeout + time.Second)
-	for _, p := range pair[0].dev.peers.keyMap {
-		if moved := p.txBytes.Load() + p.rxBytes.Load() - before; moved > 0 {
-			t.Fatalf("idle tunnel moved %d B", moved)
+	d.RecordSize(9000)
+	for range 100 {
+		if got := d.dummySize(1280); got > 1280 {
+			t.Fatalf("dummy size %d is over the MTU", got)
 		}
 	}
 }

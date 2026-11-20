@@ -13,9 +13,9 @@ func (peer *Peer) DaitaEnabled() bool {
 	return peer.daita.Load() != nil
 }
 
-// SetConstantPacketSize reports whether the setting changed.
-func (peer *Peer) SetConstantPacketSize(on bool) bool {
-	return peer.constantPacketSize.Swap(on) != on
+// PaddingBytes is the wire bytes of dummy packets sent and received, which TxBytes and RxBytes include.
+func (peer *Peer) PaddingBytes() (tx, rx uint64) {
+	return peer.paddingTx.Load(), peer.paddingRx.Load()
 }
 
 func (peer *Peer) countOutbound(elem *QueueOutboundElement) {
@@ -40,14 +40,13 @@ func (peer *Peer) HasReplaceablePackets() bool {
 func (peer *Peer) resetOutboundAndReplaced() {
 	peer.outboundPackets.Store(0)
 	peer.replacedPackets.Store(0)
-	if d := peer.getDaita(); d != nil {
-		d.dropHeld(peer)
-	}
 }
 
 func (peer *Peer) closeDaita() {
 	if d := peer.daita.Swap(nil); d != nil {
 		(*d).Close()
+		tx, rx := peer.PaddingBytes()
+		peer.device.log.Verbosef("%v - padding: dummy bytes sent %d, received %d", peer, tx, rx)
 	}
 }
 

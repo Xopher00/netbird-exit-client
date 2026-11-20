@@ -113,12 +113,12 @@ func DialDoH(ctx context.Context, dial DialFunc, addr, name string, base *tls.Co
 }
 
 func dialAny(ctx context.Context, dial DialFunc, host, port string) (net.Conn, error) {
-	ips, err := addresses(ctx, dial, host)
+	e, err := resolve(ctx, dial, host, false)
 	if err != nil {
 		return nil, err
 	}
 	var last error
-	for _, ip := range ips {
+	for _, ip := range e.ips {
 		raw, err := dial(ctx, "tcp", net.JoinHostPort(ip, port))
 		if err == nil {
 			return raw, nil
@@ -138,7 +138,7 @@ func DialTLS(ctx context.Context, dial DialFunc, addr, name string, base *tls.Co
 	if name == "" {
 		name = host
 	}
-	e, err := lookup(ctx, dial, name)
+	e, err := resolve(ctx, dial, name, true)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +180,7 @@ func handshake(ctx context.Context, dial DialFunc, name, port string, e entry, b
 		cfg.EncryptedClientHelloConfigList = e.ech
 		c := tls.Client(raw, cfg)
 		err = c.HandshakeContext(ctx)
-		// Go fails a rejected ECH handshake itself (TestServerWithoutECHIsRefused); this guards that behaviour.
+		// Go fails a rejected ECH handshake itself; this guards that behaviour.
 		if err == nil && !c.ConnectionState().ECHAccepted {
 			err = fmt.Errorf("ech not accepted by %s", name)
 		}
@@ -237,19 +237,11 @@ func askAll(ctx context.Context, dial DialFunc, host string, types []uint16) []r
 	return results
 }
 
-// addresses gives host's A and AAAA records over DNS over HTTPS, cached by TTL under a key that cannot meet lookup's.
-func addresses(ctx context.Context, dial DialFunc, host string) ([]string, error) {
-	key := "doh:" + host
-	mu.Lock()
-	e, ok := cache[key]
-	mu.Unlock()
-	if ok && time.Now().Before(e.until) {
-		return e.ips, nil
-	}
+// ipsOf collects the A then AAAA addresses of the answered lookups, the smallest TTL starting from ttl, and the last
+// lookup's error.
+func ipsOf(results []result, ttl uint32) (ips []string, minTTL uint32, last error) {
 	var v4, v6 []string
-	ttl := uint32(3600)
-	var last error
-	for _, r := range askAll(ctx, dial, host, []uint16{dns.TypeA, dns.TypeAAAA}) {
+	for _, r := range results {
 		if r.err != nil {
 			last = r.err
 			continue
@@ -264,32 +256,47 @@ func addresses(ctx context.Context, dial DialFunc, host string) ([]string, error
 			}
 		}
 	}
-	ips := append(v4, v6...)
-	if len(ips) == 0 {
-		if last == nil {
-			last = fmt.Errorf("%s has no address in DNS", host)
-		}
-		return nil, last
-	}
-	store(key, entry{ips: ips, until: time.Now().Add(time.Duration(max(ttl, 60)) * time.Second)})
-	return ips, nil
+	return append(v4, v6...), ttl, last
 }
 
-func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
+// resolve gives host's addresses over DNS over HTTPS, cached by their TTL (at least 60 s). withECH also asks for the
+// host's ECH key and refuses a host that publishes none; the two lookups are cached under keys that cannot meet.
+func resolve(ctx context.Context, dial DialFunc, host string, withECH bool) (entry, error) {
+	key, types := "doh:"+host, []uint16{dns.TypeA, dns.TypeAAAA}
+	if withECH {
+		key, types = host, []uint16{dns.TypeHTTPS, dns.TypeA, dns.TypeAAAA}
+	}
 	mu.Lock()
-	e, ok := cache[host]
+	e, ok := cache[key]
 	mu.Unlock()
 	if ok && time.Now().Before(e.until) {
 		return e, nil
 	}
-	results := askAll(ctx, dial, host, []uint16{dns.TypeHTTPS, dns.TypeA, dns.TypeAAAA})
-	if results[0].err != nil {
-		return entry{}, results[0].err
+	results := askAll(ctx, dial, host, types)
+	e, ttl := entry{}, uint32(3600)
+	if withECH {
+		if results[0].err != nil {
+			return entry{}, results[0].err
+		}
+		e.ech, ttl, results = echOf(results[0].rrs), results[0].ttl, results[1:]
+		if len(e.ech) == 0 {
+			return entry{}, fmt.Errorf("%s publishes no ECH key; refusing a connection that would show its name", host)
+		}
 	}
-	var ech []byte
-	var v4, v6 []string
-	ttl := results[0].ttl
-	for _, rr := range results[0].rrs {
+	ips, ttl, last := ipsOf(results, ttl)
+	if len(ips) == 0 {
+		if last == nil {
+			last = fmt.Errorf("%s has no address in DNS", host)
+		}
+		return entry{}, last
+	}
+	e.ips, e.until = ips, time.Now().Add(time.Duration(max(ttl, 60))*time.Second)
+	store(key, e)
+	return e, nil
+}
+
+func echOf(rrs []dns.RR) (ech []byte) {
+	for _, rr := range rrs {
 		if h, ok := rr.(*dns.HTTPS); ok {
 			for _, kv := range h.Value {
 				if c, ok := kv.(*dns.SVCBECHConfig); ok {
@@ -298,30 +305,7 @@ func lookup(ctx context.Context, dial DialFunc, host string) (entry, error) {
 			}
 		}
 	}
-	for _, r := range results[1:] {
-		if r.err != nil {
-			continue
-		}
-		ttl = min(ttl, r.ttl)
-		for _, rr := range r.rrs {
-			switch a := rr.(type) {
-			case *dns.A:
-				v4 = append(v4, a.A.String())
-			case *dns.AAAA:
-				v6 = append(v6, a.AAAA.String())
-			}
-		}
-	}
-	if len(ech) == 0 {
-		return entry{}, fmt.Errorf("%s publishes no ECH key; refusing a connection that would show its name", host)
-	}
-	ips := append(v4, v6...)
-	if len(ips) == 0 {
-		return entry{}, fmt.Errorf("%s has no address in DNS", host)
-	}
-	e = entry{ips: ips, ech: ech, until: time.Now().Add(time.Duration(max(ttl, 60)) * time.Second)}
-	store(host, e)
-	return e, nil
+	return ech
 }
 
 // query asks every resolver at once (RFC 8484, POST), because a network can block one of them and waiting it out would

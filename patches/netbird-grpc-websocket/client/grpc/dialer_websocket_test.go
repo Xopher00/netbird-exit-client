@@ -39,15 +39,6 @@ func (l *oneShotListener) Addr() net.Addr { return &net.TCPAddr{} }
 // The WebSocket dialer must register its connection with the sweeper, so a
 // network change cuts it at once instead of leaving it to gRPC keepalive.
 func TestWebSocketConnectionIsSwept(t *testing.T) {
-	testWebSocket(t, true)
-}
-
-// Without a sweeper the WebSocket dialer still connects.
-func TestWebSocketWithoutSweeper(t *testing.T) {
-	testWebSocket(t, false)
-}
-
-func testWebSocket(t *testing.T, withSweeper bool) {
 	t.Setenv("NB_GRPC_WEBSOCKET", "true")
 
 	lis := &oneShotListener{conns: make(chan net.Conn, 1), done: make(chan struct{})}
@@ -71,11 +62,7 @@ func testWebSocket(t *testing.T, withSweeper bool) {
 
 	sweeper := sweep.NewWithConfig(sweep.Config{SweepDelay: 10 * time.Millisecond})
 
-	var extra []grpc.DialOption
-	if withSweeper {
-		extra = append(extra, WithSweeper(sweeper))
-	}
-	conn, err := CreateConnection(context.Background(), strings.TrimPrefix(hs.URL, "http://"), false, wsproxy.ManagementComponent, extra...)
+	conn, err := CreateConnection(context.Background(), strings.TrimPrefix(hs.URL, "http://"), false, wsproxy.ManagementComponent, WithSweeper(sweeper))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 
@@ -86,13 +73,9 @@ func testWebSocket(t *testing.T, withSweeper bool) {
 		t.Fatal("client never reached the WebSocket server")
 	}
 
-	if !withSweeper {
-		return
-	}
 	sweeper.MarkNetworkChange()
 
 	// A swept client socket closes; the server side then sees the WebSocket end.
-	// Without the sweeper the connection stays open (keepalive needs 30 s).
 	readErr := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 4096)

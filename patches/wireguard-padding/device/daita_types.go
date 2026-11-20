@@ -28,50 +28,11 @@ const (
 	DaitaOffsetTotalLength uint16 = 2
 )
 
+// Daita is what the device's send and receive paths call. Padding-only machines author only SendPadding, so the
+// paths send the six events from NormalReceived to TunnelSent alone; machine is set only for PaddingSent.
 type Daita interface {
 	Close()
-	NormalSent(peer *Peer)
-	NormalReceived(peer *Peer)
-	PaddingSent(peer *Peer, machine_id uint64)
-	PaddingReceived(peer *Peer)
-	TunnelSent(peer *Peer)
-	TunnelReceived(peer *Peer)
-
-	// Blocking (the Maybenot BlockOutgoing action): blockHolds takes a TUN batch into the hold queue
-	// while a block is active (false: not blocked, or the hold is full and the batch flows through);
-	// maySend reports whether padding with the bypass flag may leave during the block; holdPadding takes a built
-	// padding packet into the hold; releaseHeld sends every held packet at the block's end; dropHeld
-	// discards them (peer stopped or reset).
-	blockHolds(elems []*QueueOutboundElement) bool
-	maySend(bypass bool) bool
-	holdPadding(elem *QueueOutboundElement, machine uint64) bool
-	releaseHeld(peer *Peer)
-	dropHeld(peer *Peer)
-}
-
-func (event EventType) String() string {
-	var pretty string
-	switch event {
-	case NormalReceived:
-		pretty = "NormalReceived"
-	case PaddingReceived:
-		pretty = "PaddingReceived"
-	case TunnelReceived:
-		pretty = "TunnelReceived"
-	case NormalSent:
-		pretty = "NormalSent"
-	case PaddingSent:
-		pretty = "PaddingSent"
-	case TunnelSent:
-		pretty = "TunnelSent"
-	case BlockingBegin:
-		pretty = "BlockingBegin"
-	case BlockingEnd:
-		pretty = "BlockingEnd"
-	case TimerBegin:
-		pretty = "TimerBegin"
-	case TimerEnd:
-		pretty = "TimerEnd"
-	}
-	return pretty
+	Event(peer *Peer, eventType EventType, machine uint64)
+	// RecordSize notes the size of a real packet sent, so dummies take sizes the peer really sends.
+	RecordSize(size int)
 }

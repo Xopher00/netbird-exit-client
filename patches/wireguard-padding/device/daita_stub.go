@@ -6,3 +6,7 @@ func (peer *Peer) EnableDaita(machines string, eventsCapacity uint, maxPaddingFr
 	peer.device.log.Errorf("%v - DAITA requested, but this build has no DAITA (build tag daita)", peer)
 	return false
 }
+
+func (peer *Peer) EnablePadding(role string) bool {
+	return peer.EnableDaita("", 0, 0, 0)
+}

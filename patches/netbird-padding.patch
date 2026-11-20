@@ -1,5 +1,5 @@
 diff --git a/client/iface/configurer/usp.go b/client/iface/configurer/usp.go
-index 2b4f7381..efb8791f 100644
+index 2b4f7381..699f89ab 100644
 --- a/client/iface/configurer/usp.go
 +++ b/client/iface/configurer/usp.go
 @@ -122,6 +122,7 @@ func (c *WGUSPConfigurer) UpdatePeer(peerKey string, allowedIps []netip.Prefix,
@@ -10,3 +10,31 @@ index 2b4f7381..efb8791f 100644
  
  	if endpoint != nil {
  		c.activityRecorder.UpsertAddress(peerKey, addrPort)
+@@ -274,21 +275,23 @@ func (c *WGUSPConfigurer) fetchStats() (map[string]WGStats, error) {
+ 	peers := c.device.Peers()
+ 	stats := make(map[string]WGStats, len(peers))
+ 	for _, peer := range peers {
++		tx, rx := realBytes(peer)
+ 		stats[wgtypes.Key(peer.PublicKey()).String()] = WGStats{
+ 			LastHandshake: peer.LastHandshake(),
+-			TxBytes:       int64(peer.TxBytes()),
+-			RxBytes:       int64(peer.RxBytes()),
++			TxBytes:       tx,
++			RxBytes:       rx,
+ 		}
+ 	}
+ 	return stats, nil
+ }
+ 
+ func peerStats(peer *wgbackend.Peer) Peer {
++	tx, rx := realBytes(peer)
+ 	stats := Peer{
+ 		PublicKey:     wgtypes.Key(peer.PublicKey()).String(),
+ 		AllowedIPs:    prefixesToIPNets(peer.AllowedIPs()),
+-		TxBytes:       int64(peer.TxBytes()),
+-		RxBytes:       int64(peer.RxBytes()),
++		TxBytes:       tx,
++		RxBytes:       rx,
+ 		LastHandshake: peer.LastHandshake(),
+ 		PresharedKey:  [32]byte(peer.PresharedKey()),
+ 	}

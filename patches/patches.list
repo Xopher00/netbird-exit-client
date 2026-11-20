@@ -1,15 +1,16 @@
 # Hopper's NetBird patches, in apply order (later ones build on earlier ones).
 # Second word on: phone = the app's library (app/scripts/build-engine.sh), exit = the exit servers' client
 # (exit-server/scripts/build.sh, copied to the public repo by publish.sh).
-# A line with "wireguard" applies to the wireguard-go checkout instead of NetBird.
+# A line with "wireguard" applies to the wireguard-go checkout instead of NetBird, and a line with "xray"
+# to the Xray-core checkout (phone only; the exit server runs no Xray).
 
 # gRPC to Management and Signal: with NB_GRPC_WEBSOCKET=true it rides the self-hosted server's WebSocket wrapper, for hosts behind a proxy that does not pass gRPC; and the reconnect wait is capped at 30 s, down from 120 s, so a client reaches a server soon after it wakes.
 netbird-grpc-websocket.patch phone exit
-# Padding, NetBird's half: each peer update switches on Maybenot padding when NB_DAITA_MACHINES holds machines, and full-size packets when NB_DAITA_FULL_SIZE=true. The machinery is wireguard-padding.patch.
+# Padding, NetBird's half: with NB_DAITA=client or server, each peer update switches on this end's half of a generated defense; peer byte counts leave out the dummy packets. The machinery is wireguard-padding.patch.
 netbird-padding.patch phone exit
 # Connections to the hosts in NB_ECH_HOST use ECH after a DNS-over-HTTPS lookup, or are refused; any other host resolves over DNS over HTTPS, with the network's DNS as the fallback. The app sets NB_RELAY_TRANSPORT=ws so the relay never uses QUIC.
 netbird-ech.patch phone exit
 # The answer goes out before ICE candidates, and each new ICE agent gets the remote candidates of the last 5 s, so a direct link can form in the first round instead of after minutes on the relay. Drop this once upstream fixes it (netbirdio/netbird discussion 8443; still unfixed in v0.82.1).
 netbird-ice-first-round.patch phone exit
-# Padding, wireguard-go's half: Mullvad's DAITA ported to the batched send path, with the Maybenot BlockOutgoing action; built with Rust maybenot-ffi for arm64.
+# Padding, wireguard-go's half: Mullvad's DAITA ported to the batched send path, for machines that only send padding. A compiled-in set of generated defenses, chosen by the two public keys so both ends agree; dummies take the sizes of the peer's recent real packets; real packets keep their sizes. Built with Rust maybenot-ffi.
 wireguard-padding.patch wireguard phone exit

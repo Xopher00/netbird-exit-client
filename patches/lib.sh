@@ -1,7 +1,7 @@
 # Shared by app/scripts/build-engine.sh, exit-server/scripts/build.sh and check.sh; sourced, not run. Names no deployment.
 
-# pick LIST BUILD KIND: patch names in LIST marked BUILD; KIND is "wireguard" or "netbird".
-pick() { awk -v b="$2" -v k="$3" '/^#/ || !NF {next} {w=0; n=0; for (i=2; i<=NF; i++) {if ($i=="wireguard") w=1; if ($i==b) n=1} if (n && ((k=="wireguard")==w)) print $1}' "$1" ; }
+# pick LIST BUILD KIND: patch names in LIST marked BUILD; KIND is "wireguard", "xray" or "netbird".
+pick() { awk -v b="$2" -v k="$3" '/^#/ || !NF {next} {w=0; x=0; n=0; for (i=2; i<=NF; i++) {if ($i=="wireguard") w=1; if ($i=="xray") x=1; if ($i==b) n=1} if (n && ((k=="wireguard")==w) && ((k=="xray")==x)) print $1}' "$1" ; }
 
 # copy_new_files SRC DST: copies the files under SRC into DST, refusing to overwrite one that already exists.
 copy_new_files() {
@@ -26,6 +26,22 @@ apply_patches() {
     git -C "$wt" apply "$pdir/$p" || { echo "$p does not apply ($kind, $build)" >&2; return 1; }
     if [ -d "$pdir/${p%.patch}" ]; then copy_new_files "$pdir/${p%.patch}" "$wt" || return 1; fi
   done < <(pick "$list" "$build" "$kind")
+}
+
+# ensure_rev DIR URL REV [CLONE_ARGS...]: DIR holds REV (refs/tags/<tag>, or a commit): cloned from URL with CLONE_ARGS
+# when missing, fetched when REV is absent. Fails with a message when REV is still absent; the caller decides what that means.
+ensure_rev() {
+  local dir=$1 url=$2 rev=$3
+  shift 3
+  if [ ! -d "$dir" ]; then
+    git clone -q "$@" "$url" "$dir" >/dev/null 2>&1 || { echo "cannot clone $url into $dir" >&2; return 1; }
+  fi
+  git -C "$dir" rev-parse -q --verify "$rev^{commit}" >/dev/null && return 0
+  case $rev in
+    refs/tags/*) git -C "$dir" fetch -q origin tag "${rev#refs/tags/}" >/dev/null 2>&1 || true ;;
+    *) git -C "$dir" fetch -q origin >/dev/null 2>&1 || true ;;
+  esac
+  git -C "$dir" rev-parse -q --verify "$rev^{commit}" >/dev/null || { echo "$dir has no $rev" >&2; return 1; }
 }
 
 # wg_commit NB_SRC NB_VERSION: the netbirdio/wireguard-go commit that release pins.

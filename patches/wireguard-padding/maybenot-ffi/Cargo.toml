@@ -15,4 +15,4 @@ edition = "2021"
 
 [dependencies]
 # If this is bumped, check if `maybenot.h` has to be updated. See README.md
-maybenot-ffi = "2.0.1"
+maybenot-ffi = "2.2.2"

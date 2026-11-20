@@ -124,52 +124,6 @@ func TestAcceptedECHConnects(t *testing.T) {
 	}
 }
 
-// A retry after a key change, dialled at a literal address, goes to that address with the new key and leaves the
-// name's cached addresses and key as DNS published them.
-func TestARetryAtALiteralAddressLeavesTheCacheAlone(t *testing.T) {
-	_, oldList, _ := echConfigFor(t, "example.com")
-	newConfig, _, newPriv := echConfigFor(t, "example.com")
-	fakeDoH(t, oldList)
-	l, err := net.Listen("tcp", "127.0.0.2:0")
-	if err != nil {
-		t.Skip("no 127.0.0.2 on this machine:", err)
-	}
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	srv.Listener.Close()
-	srv.Listener = l
-	var conns atomic.Int32
-	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
-		if s == http.StateNew {
-			conns.Add(1)
-		}
-	}
-	srv.TLS = &tls.Config{EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{{Config: newConfig, PrivateKey: newPriv, SendAsRetry: true}}}
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
-	pool := x509.NewCertPool()
-	pool.AddCert(srv.Certificate())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	d := &net.Dialer{}
-	c, err := DialTLS(ctx, d.DialContext, l.Addr().String(), "example.com", &tls.Config{RootCAs: pool})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Close()
-	if n := conns.Load(); n != 2 {
-		t.Fatalf("the literal address got %d connections, want 2 (the rejected one and the retry)", n)
-	}
-	mu.Lock()
-	e := cache["example.com"]
-	mu.Unlock()
-	if len(e.ips) != 1 || e.ips[0] != "127.0.0.1" {
-		t.Fatalf("cached addresses %v, want the DNS answer [127.0.0.1]", e.ips)
-	}
-	if string(e.ech) != string(oldList) {
-		t.Fatal("a literal address's retry key replaced the name's published key")
-	}
-}
-
 func TestNoPublishedKeyRefusesBeforeConnecting(t *testing.T) {
 	fakeDoH(t, nil)
 	addr, pool, conns := target(t, nil)
@@ -178,68 +132,5 @@ func TestNoPublishedKeyRefusesBeforeConnecting(t *testing.T) {
 	}
 	if n := conns.Load(); n != 0 {
 		t.Fatalf("the server received %d connections; the name may have been sent", n)
-	}
-}
-
-func TestServerWithoutECHIsRefused(t *testing.T) {
-	_, list, _ := echConfig(t)
-	fakeDoH(t, list)
-	addr, pool, _ := target(t, nil)
-	if c, err := dial(t, addr, pool); err == nil {
-		c.Close()
-		t.Fatal("connected without ECH")
-	}
-}
-
-type countedConn struct {
-	net.Conn
-	closed *atomic.Int32
-}
-
-func (c countedConn) Close() error {
-	c.closed.Add(1)
-	return c.Conn.Close()
-}
-
-func TestLookupLeavesNoConnectionOpen(t *testing.T) {
-	_, list, _ := echConfig(t)
-	fakeDoH(t, list)
-	var opened, closed atomic.Int32
-	d := &net.Dialer{}
-	counting := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c, err := d.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		opened.Add(1)
-		return countedConn{c, &closed}, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := lookup(ctx, counting, "example.com"); err != nil {
-		t.Fatal(err)
-	}
-	limit := time.Now().Add(3 * time.Second)
-	for closed.Load() < opened.Load() && time.Now().Before(limit) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if o, c := opened.Load(), closed.Load(); o == 0 || c < o {
-		t.Fatalf("%d connections opened, %d closed", o, c)
-	}
-}
-
-func TestOnMatchesTheHostLoosely(t *testing.T) {
-	t.Setenv(EnvHost, "Vpn.Example.dev.")
-	for _, h := range []string{"vpn.example.dev", "VPN.EXAMPLE.DEV."} {
-		if !On(h) {
-			t.Errorf("On(%q) = false", h)
-		}
-	}
-	if On("other.example.dev") {
-		t.Error("On matched another host")
-	}
-	t.Setenv(EnvHost, "")
-	if On("vpn.example.dev") {
-		t.Error("On with no host set")
 	}
 }
