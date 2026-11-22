@@ -1,5 +1,5 @@
 diff --git a/client/grpc/dialer.go b/client/grpc/dialer.go
-index 69b37a9f..88d811fb 100644
+index 37a19d2c..85f403b1 100644
 --- a/client/grpc/dialer.go
 +++ b/client/grpc/dialer.go
 @@ -21,6 +21,7 @@ import (
@@ -27,6 +27,59 @@ index 69b37a9f..88d811fb 100644
  	return func(ctx context.Context, addr string) (net.Conn, error) {
  		c, _, err := websocket.Dial(ctx, scheme+"://"+addr+wsproxy.ProxyPath+component, &websocket.DialOptions{HTTPClient: httpClient})
  		if err != nil {
+diff --git a/client/internal/dns/server.go b/client/internal/dns/server.go
+index 3af91279..f966a357 100644
+--- a/client/internal/dns/server.go
++++ b/client/internal/dns/server.go
+@@ -284,7 +284,7 @@ func newDefaultServer(
+ 	ctx, stop := context.WithCancel(ctx)
+ 
+ 	mgmtCacheResolver := mgmt.NewResolver()
+-	mgmtCacheResolver.SetChainResolver(handlerChain, PriorityUpstream)
++	mgmtCacheResolver.SetChainResolver(dohChain{}, PriorityUpstream)
+ 
+ 	defaultServer := &DefaultServer{
+ 		ctx:               ctx,
+diff --git a/client/internal/dns/upstream_android.go b/client/internal/dns/upstream_android.go
+index f7ab48b1..c14c524f 100644
+--- a/client/internal/dns/upstream_android.go
++++ b/client/internal/dns/upstream_android.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/netbirdio/netbird/client/internal/peer"
+ 	nbnet "github.com/netbirdio/netbird/client/net"
++	"github.com/netbirdio/netbird/client/net/doh"
+ 	"github.com/netbirdio/netbird/shared/management/domain"
+ )
+ 
+@@ -48,11 +49,24 @@ func (u *upstreamResolver) exchange(ctx context.Context, upstream string, r *dns
+ 	}
+ }
+ 
++// tunnelDoH's sockets are not protected, so the lookups take the tunnel as an app's traffic does.
++var tunnelDoH = doh.NewForwarder((&net.Dialer{}).DialContext)
++
++// exchangeWithinVPN asks the nameserver over DNS over HTTPS at its own address, never in plain DNS.
+ func (u *upstreamResolver) exchangeWithinVPN(ctx context.Context, upstream string, r *dns.Msg) (rm *dns.Msg, t time.Duration, err error) {
+-	upstreamExchangeClient := &dns.Client{
+-		Timeout: ClientTimeout,
++	ap, err := netip.ParseAddrPort(upstream)
++	if err != nil {
++		return nil, 0, err
+ 	}
+-	return ExchangeWithFallback(ctx, upstreamExchangeClient, r, upstream)
++	start := time.Now()
++	if rm, err = tunnelDoH.Forward(ctx, ap.Addr(), r); err != nil {
++		return nil, time.Since(start), err
++	}
++	setUpstreamProtocol(ctx, "doh")
++	if max := clientUDPMaxSize(r); dnsProtocolFromContext(ctx) != protoTCP && rm.Len() > max {
++		rm.Truncate(max)
++	}
++	return rm, time.Since(start), nil
+ }
+ 
+ // exchangeWithoutVPN protect the UDP socket by Android SDK to avoid to goes through the VPN
 diff --git a/client/net/protectsocket_android.go b/client/net/protectsocket_android.go
 index 00071461..f8b72c25 100644
 --- a/client/net/protectsocket_android.go
@@ -41,7 +94,7 @@ index 00071461..f8b72c25 100644
  		}
  
 diff --git a/shared/relay/client/dialer/ws/ws.go b/shared/relay/client/dialer/ws/ws.go
-index 6b310b73..ecadacb0 100644
+index 6b310b73..93d73a59 100644
 --- a/shared/relay/client/dialer/ws/ws.go
 +++ b/shared/relay/client/dialer/ws/ws.go
 @@ -14,6 +14,7 @@ import (
